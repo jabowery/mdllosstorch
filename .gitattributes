@@ -1,0 +1,52 @@
+# Normalize line endings
+* text=auto eol=lf
+
+# Shell / batch scripts
+*.sh  text eol=lf
+*.bash text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Treat common binary types as binary (no diffs)
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.svg  text
+*.pdf  binary
+*.zip  binary
+*.tar  binary
+*.gz   binary
+*.whl  binary
+
+# Python: ensure LF endings
+*.py   text eol=lf
+*.pyi  text eol=lf
+*.toml text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.ini  text eol=lf
+*.md   text eol=lf
+*.rst  text eol=lf
+*.cfg  text eol=lf
+Makefile text eol=lf
+
+# GitHub Linguist tuning:
+# Count primary language from src/, de-emphasize tests/ and CI
+tests/** linguist-documentation
+.github/** linguist-vendored
+
+# Exclude dev-only files from `git archive` (e.g., GitHub source downloads)
+# (Does NOT affect PyPI builds; use MANIFEST.in for that.)
+/.github            export-ignore
+/.venv              export-ignore
+/.pytest_cache      export-ignore
+/.mypy_cache        export-ignore
+/.ruff_cache        export-ignore
+/README.md          export-ignore
+/CONTRIBUTING.md    export-ignore
+/requirements-dev.txt export-ignore
+/Makefile           export-ignore
+/tox.ini            export-ignore
+/ruff.toml          export-ignore
+/pytest.ini         export-ignore
