@@ -1,35 +1,40 @@
 
 # mdllosstorch
 
-MDL-friendly loss components for PyTorch:
+Minimum Description Length (MDL) loss components for PyTorch.
 
-- Transformed residual bits: Yeo-Johnson (or Box-Cox) + Jacobian + lambda parameter bits + discretization.
-- Parameter bits: Student-t prior (continuous nu,sigma), differentiable w.r.t. weights.
-- Discretization correction converts differential code lengths to discrete bits (positive).
+This repository provides implementations of:
 
-## Install
+- Transformed residual coding (Yeo-Johnson / Box-Cox + Jacobian + discretization)
+- Student-t parameter coding with discretization
+- Unified `MDLLoss` module for PyTorch
 
+---
+
+## Documentation by Role
+
+Different audiences should follow different guides:
+
+- [README.users.md](README.users.md) — For **users** installing and using `mdllosstorch` in their own projects.
+- [README.maintainers.md](README.maintainers.md) — For **maintainers** releasing new versions to PyPI.
+- [README.developers.md](README.developers.md) — For **developers** contributing to the project.
+
+---
+
+## Quickstart (User)
 ```bash
-pip install .  # from project root
+pip install mdllosstorch
 ```
-
-## Minimal Example
 
 ```python
 import torch
 from mdllosstorch import MDLLoss
 
 model = torch.nn.Linear(10, 10)
-x = torch.randn(64, 10)
+x = torch.randn(32, 10)
 yhat = model(x)
 
-loss_fn = MDLLoss(method="yeo-johnson")
-mdl_bits = loss_fn(x, yhat, model)
-mdl_bits.backward()
-```
-
-## Tests
-
-```bash
-pytest -q
+loss_fn = MDLLoss()
+bits = loss_fn(x, yhat, model)
+print("Total MDL (bits):", bits.item())
 ```

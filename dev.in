@@ -1,0 +1,9 @@
+# dev tools only (unpinned)
+pytest
+ruff
+black
+mypy
+pre-commit
+tox
+build
+twine

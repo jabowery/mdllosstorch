@@ -1,0 +1,43 @@
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Upgrade pip
+        run: python -m pip install -U pip
+
+      - name: Install package with dev extras (constrained if available)
+        run: |
+          if [ -f constraints.txt ]; then
+            pip install -e ".[dev]" -c constraints.txt
+          else
+            pip install -e ".[dev]"
+          fi
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Twine check
+        run: python -m twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
