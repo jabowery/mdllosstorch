@@ -1,0 +1,17 @@
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdllosstorch"
+version = "0.1.0"
+description = "MDL loss components for PyTorch: transformed residuals (Yeo-Johnson/Box-Cox with Jacobian) and heavy-tailed parameter bits, with discretization for positivity."
+authors = [{name="MDL Labs"}]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = ["torch>=1.12"]
+
+[project.urls]
+Homepage = "https://example.com/mdllosstorch"
