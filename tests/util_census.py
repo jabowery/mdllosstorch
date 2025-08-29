@@ -12,12 +12,10 @@ def _sniff_delimiter(path: str) -> str:
 
 def load_census_df(max_rows: int = 5000, max_cols: int = 512) -> pd.DataFrame:
     path = (
-        os.getenv("LOTC_CENSUS_TSV_BZ2")
-        or os.getenv("LOTC_CENSUS_BZ2")
-        or os.getenv("LOTC_CENSUS_NPZ")
+        os.getenv("LOTC_CENSUS_BZ2")
     )
     if not path or not os.path.exists(path):
-        raise FileNotFoundError("Set LOTC_CENSUS_TSV_BZ2 or LOTC_CENSUS_BZ2 or LOTC_CENSUS_NPZ to a valid file path")
+        raise FileNotFoundError("Set  LOTC_CENSUS_BZ2 to a valid file path")
 
     if path.endswith(".npz"):
         arrs = np.load(path, allow_pickle=False)
