@@ -25,3 +25,4 @@ loss_fn = MDLLoss()
 bits = loss_fn(x, yhat, model)
 print("Total MDL (bits):", bits.item())
 ```
+[API Documentation](mdllosstorch_API.pdf)
