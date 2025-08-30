@@ -14,14 +14,34 @@ def load_census_df(max_rows: int = 5000, max_cols: int = 512) -> pd.DataFrame:
     if not path.endswith(".tsv.bz2"):
         raise ValueError(f"Only .tsv.bz2 is supported for now, got: {path}")
 
-    # Optional normalized path via your tests/county_data.py
+    # Optional normalized path via tests/county_data.py
     use_getdf = os.getenv("LOTC_USE_GETDF", "0").lower() in ("1", "true", "yes", "on")
     if use_getdf:
         try:
-            from county_data import getdf  # lives in ./tests
-            df = getdf()                  # getdf reads LOTC_CENSUS_BZ2 internally
-        except Exception as e:
-            raise RuntimeError("LOTC_USE_GETDF=1 but county_data.getdf() failed") from e
+            # First try normal import (works under pytest when tests/ is on sys.path via config)
+            from county_data import getdf  # type: ignore
+        except Exception:
+            # Running outside pytest (e.g., scripts/) often doesn't include tests/ on sys.path.
+            # Add the tests/ directory (where this file lives) to sys.path and retry.
+            try:
+                import sys
+                from pathlib import Path
+                tests_dir = Path(__file__).resolve().parent
+                if str(tests_dir) not in sys.path:
+                    sys.path.insert(0, str(tests_dir))
+                from county_data import getdf  # type: ignore
+            except Exception as e:
+                # Graceful fallback: warn once, then use raw TSV
+                print("Warning: LOTC_USE_GETDF=1 but could not import tests/county_data.getdf(); falling back to raw TSV.", flush=True)
+                getdf = None
+        if 'getdf' in locals() and callable(getdf):
+            try:
+                df = getdf()  # county_data.getdf() should read LOTC_CENSUS_BZ2 itself
+            except Exception as e:
+                print(f"Warning: county_data.getdf() failed ({e}); falling back to raw TSV.", flush=True)
+                df = pd.read_csv(path, sep="\t", compression="bz2", index_col="STCOU", low_memory=False)
+        else:
+            df = pd.read_csv(path, sep="\t", compression="bz2", index_col="STCOU", low_memory=False)
     else:
         df = pd.read_csv(path, sep="\t", compression="bz2", index_col="STCOU", low_memory=False)
 
@@ -57,9 +77,7 @@ def estimate_global_resolution(df: pd.DataFrame, sample_per_col: int = 20000, mi
         pos = diffs[diffs > min_positive]
         if pos.size:
             resolutions.append(float(np.min(pos)))
-    # If *no* column yielded a positive gap, fall back
     if not resolutions:
         return 1e-6
-    # Median across columns, but clamp to keep MDL baseline meaningful on coarse data
     res = float(np.median(resolutions))
     return float(np.clip(res, 1e-12, 2.5e-1))
