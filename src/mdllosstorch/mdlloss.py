@@ -9,19 +9,6 @@ class MDLLoss(nn.Module):
     L = residual_bits (Yeo-Johnson/Box-Cox + Jacobian + discretization)
       + parameter_bits (Student-t with discretization)
     """
-    def __init__(self, method: str = "yeo-johnson",
-                 data_resolution: float = 1e-6,
-                 param_resolution: float = 1e-6,
-                 include_transform_param_bits: bool = True,
-                 lam_grid: torch.Tensor = None,
-                 coder: str = "legacy"):
-        super().__init__()
-        self.method = method
-        self.data_resolution = float(data_resolution)
-        self.param_resolution = float(param_resolution)
-        self.coder = coder  # NEW: "legacy" (default) or "gauss_nml"
-        self.include_transform_param_bits = include_transform_param_bits
-        self._lam_grid = lam_grid
     def forward(self, original: torch.Tensor, reconstructed: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
         if self.coder == "gauss_nml":
             # NEW: quantization-aware, variance-floored, absolute residual coder
@@ -51,6 +38,19 @@ class MDLLoss(nn.Module):
                 model, include_param_bits=True, param_resolution=self.param_resolution
             )
             return res_bits + par_bits
+    def __init__(self, method: str = "yeo-johnson",
+                 data_resolution: float = 1e-6,
+                 param_resolution: float = 1e-6,
+                 include_transform_param_bits: bool = True,
+                 lam_grid: torch.Tensor = None,
+                 coder: str = "gauss_nml"):
+        super().__init__()
+        self.method = method
+        self.data_resolution = float(data_resolution)
+        self.param_resolution = float(param_resolution)
+        self.coder = coder  # default is now "gauss_nml" (absolute & quantization-aware)
+        self.include_transform_param_bits = include_transform_param_bits
+        self._lam_grid = lam_grid
 
 # === Auto data-resolution + convenience wrappers ===
 

@@ -16,8 +16,10 @@ def main():
         "--method", type=str, default="yeo-johnson", choices=["yeo-johnson", "box-cox"],
         help="transform method"
     )
-    parser.add_argument("--coder", type=str, default="gauss_nml", choices=["gauss_nml", "legacy"],
-                        help="residual coder; 'gauss_nml' is absolute & quantization-aware")
+    # Default to env LOTC_CODER if present, else "gauss_nml"
+    default_coder = os.getenv("LOTC_CODER", "gauss_nml")
+    parser.add_argument("--coder", type=str, default=default_coder, choices=["gauss_nml", "legacy"],
+                        help="residual coder; 'gauss_nml' is absolute & quantization-aware (default)")
     parser.add_argument("--report", action="store_true", help="print detailed MDL breakdown")
     args = parser.parse_args()
 
