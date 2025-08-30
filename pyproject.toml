@@ -34,6 +34,13 @@ dev = [
     "uv>=0.3"
 ]
 
+#
+# Optional dependency required ONLY for the census integration test(s)
+census = [
+  "pandas>=2.0",
+  "regex",
+]
+
 # Docs stack
 docs = [
     "mkdocs",

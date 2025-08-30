@@ -30,7 +30,8 @@ read -r -d '' PAYLOAD << 'JSON'
       { "context": "ci / test (3.10)" },
       { "context": "ci / test (3.11)" },
       { "context": "ci / test (3.12)" },
-      { "context": "ci / test (3.13)" }
+      { "context": "ci / test (3.13)" },
+      { "context": "ci / census" }
     ]
   },
   "enforce_admins": true,

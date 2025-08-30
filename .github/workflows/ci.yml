@@ -13,3 +13,27 @@ jobs:
       - run: pip install -U pip
       - run: pip install -e . -r requirements-dev.txt
       - run: pytest -q
+# Run the entropy measurement tests on actual data from the US Census
+census:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: "pip"
+
+    - name: Upgrade pip
+      run: python -m pip install -U pip
+
+    - name: Install package with dev + census extras
+      run: |
+        if [ -f constraints.txt ]; then
+          pip install -e ".[dev,census]" -c constraints.txt
+        else
+          pip install -e ".[dev,census]"
+        fi
+
+    - name: Run census integration test (will skip if dataset env not set)
+      run: pytest -q tests/test_census_integration.py
+
