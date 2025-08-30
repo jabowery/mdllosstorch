@@ -171,3 +171,41 @@ def residual_bits_transformed_softmin(
     B = torch.stack(B)
     w = torch.softmax(-B / tau, dim=0)
     return (w * B).sum()
+def _eps():
+    return 1e-12
+def gauss_nml_bits(
+    residuals: torch.Tensor,
+    *,
+    data_resolution: float,
+    per_feature: bool = True,
+    include_quantization: bool = True,
+    ) -> torch.Tensor:
+    """
+    Absolute code length (in bits) for residuals using a Gaussian-with-unknown-variance
+    NML-style approximation, with a quantization-aware variance floor.
+    """
+    x = residuals
+    if x.ndim == 1:
+        x = x.view(-1, 1)
+
+    n, d = x.shape
+    n = max(int(n), 1)
+    d = max(int(d), 1)
+
+    delta = float(max(data_resolution, _eps()))
+    sigma2_floor = (delta ** 2) / 12.0
+
+    var = x.float().pow(2).mean(dim=0) - x.float().mean(dim=0).pow(2)
+    var = torch.clamp(var, min=sigma2_floor)
+
+    diff_per_feat = 0.5 * torch.log2(2.0 * math.pi * math.e * var.clamp_min(_eps()))
+    diff_bits = n * diff_per_feat.sum()
+
+    q_const = 0.0
+    if include_quantization:
+        q_const = n * d * math.log2(max(1.0 / delta, 1.0))
+
+    penalty_sigma = 0.5 * d * math.log2(float(n))
+
+    total_bits = diff_bits + q_const + penalty_sigma
+    return total_bits

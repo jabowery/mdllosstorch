@@ -1,21 +1,33 @@
-
 #!/usr/bin/env python
-import os, argparse, numpy as np, torch
+import argparse
+import os
+import numpy as np
+import torch
+
 from mdllosstorch import MDLLoss
+from mdllosstorch.mdlloss import compute_mdl, report_mdl
 from tests.util_census import load_census_df, estimate_global_resolution
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--rows", type=int, default=5000)
-    ap.add_argument("--cols", type=int, default=512)
-    ap.add_argument("--method", type=str, default="yeo-johnson", choices=["yeo-johnson", "box-cox"])
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rows", type=int, default=5000, help="max rows to sample")
+    parser.add_argument("--cols", type=int, default=512, help="max cols to sample")
+    parser.add_argument(
+        "--method", type=str, default="yeo-johnson", choices=["yeo-johnson", "box-cox"],
+        help="transform method"
+    )
+    parser.add_argument("--coder", type=str, default="gauss_nml", choices=["gauss_nml", "legacy"],
+                        help="residual coder; 'gauss_nml' is absolute & quantization-aware")
+    parser.add_argument("--report", action="store_true", help="print detailed MDL breakdown")
+    args = parser.parse_args()
 
-    mr = None if args.rows == -1 else args.rows
-    mc = None if args.cols == -1 else args.cols
+    path = os.getenv("LOTC_CENSUS_BZ2")
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError("Set LOTC_CENSUS_BZ2 to a valid .tsv.bz2 file path")
 
-    df = load_census_df(max_rows=mr or 0, max_cols=mc or 0).astype(np.float32)
+    df = load_census_df(max_rows=args.rows, max_cols=args.cols).astype(np.float32)
     data_res = estimate_global_resolution(df)
+
     X = df.values
     X = X - np.nanmean(X, axis=0, keepdims=True)
 
@@ -23,19 +35,17 @@ def main():
     model = torch.nn.Identity()
     yhat = x_t.clone()
 
-    loss = MDLLoss(method=args.method, data_resolution=data_res, param_resolution=1e-6)
-    bits = loss(x_t, yhat, model).item()
-
-    n = X.size
-    baseline = n * float(np.log2(max(1.0 / max(data_res, 1e-12), 1.0)))
-    bps = bits / n
-
-    print("=== MDL Residual Bits (Identity reconstruction) ===")
-    print(f"shape: {X.shape}, n={n}")
-    print(f"estimated data_resolution: {data_res:.6g}")
-    print(f"total bits: {bits:.3f}")
-    print(f"baseline n*log2(1/res): {baseline:.3f}")
-    print(f"bits per entry: {bps:.6f}")
+    if args.report:
+        rpt = report_mdl(x_t, yhat, model, method=args.method, data_resolution="auto")
+        loss = MDLLoss(method=args.method, data_resolution=data_res, param_resolution=1e-6, coder=args.coder)
+        total = loss(x_t, yhat, model).item()
+        rpt["total_bits(coded)"] = total
+        for k, v in rpt.items():
+            print(f"{k:25s} : {v}")
+    else:
+        loss = MDLLoss(method=args.method, data_resolution=data_res, param_resolution=1e-6, coder=args.coder)
+        bits = loss(x_t, yhat, model)
+        print(bits.item())
 
 if __name__ == "__main__":
     main()
