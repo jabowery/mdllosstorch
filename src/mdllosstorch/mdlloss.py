@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from .residuals import residual_bits_transformed_gradsafe
+from .residuals import residual_bits_transformed_gradsafe, gauss_nml_bits
 from .parameters import parameter_bits_model_student_t
 
 
