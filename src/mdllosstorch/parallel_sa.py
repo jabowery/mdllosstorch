@@ -122,38 +122,6 @@ class MDLParallelHyperparameterSearch:
            return max(2, int(self.n_parallel * scale_factor))
        return self.n_parallel
    
-   def search_student_t_params(self, residuals):
-       """Search for optimal Student-t parameters using parallel SA"""
-       if self.param_sampler is None:
-           self.param_sampler = ParallelAdaptiveAnnealingSampler(
-               n_parallel=self.adaptive_batch_size(len(residuals)),
-               param_bounds={
-                   'nu': (1.5, 64.0),
-                   'sigma_scale': (0.25, 4.0),
-                   'lambda': (-2.0, 2.0)
-               }
-           )
-       
-       candidates = self.param_sampler.sample_candidates()
-       scores = self._evaluate_student_t_candidates(residuals, candidates)
-       best_params, accepted = self.param_sampler.update_and_accept(candidates, scores)
-       
-       return best_params['nu'], best_params['sigma_scale']
-   
-   def search_lambda_params(self, residuals, method='yeo-johnson'):
-       """Search for optimal transformation lambda using parallel SA"""
-       if self.lambda_sampler is None:
-           self.lambda_sampler = ParallelAdaptiveAnnealingSampler(
-               n_parallel=self.adaptive_batch_size(len(residuals)),
-               param_bounds={'lambda': (-2.0, 2.0)}
-           )
-       
-       candidates = self.lambda_sampler.sample_candidates()
-       scores = self._evaluate_lambda_candidates(residuals, candidates, method)
-       best_params, accepted = self.lambda_sampler.update_and_accept(candidates, scores)
-       
-       return best_params['lambda']
-   
    def _yj_transform_and_logabsdet_jac(self, r, lam):
        """Yeo-Johnson transform with Jacobian determinant"""
        rp = r >= 0
@@ -190,61 +158,91 @@ class MDLParallelHyperparameterSearch:
        
        logabsdet = (lam - 1.0) * torch.log(z).sum()
        return t, logabsdet
-   def _evaluate_student_t_candidates(self, residuals, candidates):
-      """Parallel evaluation of Student-t parameter candidates using vectorized operations"""
-      n_candidates = len(candidates)
-      n_residuals = len(residuals)
+   def search_student_t_params(self, parameters):
+      """Search for optimal Student-t parameters using parallel SA"""
+      if self.param_sampler is None:
+         self.param_sampler = ParallelAdaptiveAnnealingSampler(
+             n_parallel=self.adaptive_batch_size(len(parameters)),
+             param_bounds={
+                 'nu': (1.5, 64.0),
+                 'sigma_scale': (0.25, 4.0),
+                 'lambda': (-2.0, 2.0)
+             }
+         )
       
-      # Extract parameters into tensors for vectorized operations
-      nus = torch.tensor([params['nu'] for params in candidates], device=residuals.device, dtype=residuals.dtype)
-      sigma_scales = torch.tensor([params['sigma_scale'] for params in candidates], device=residuals.device, dtype=residuals.dtype)
+      candidates = self.param_sampler.sample_candidates()
+      scores = self._evaluate_student_t_candidates(parameters, candidates)
+      best_params, accepted = self.param_sampler.update_and_accept(candidates, scores)
+      
+      return best_params['nu'], best_params['sigma_scale']
+   def _evaluate_student_t_candidates(self, parameters, candidates):
+      """Parallel evaluation of Student-t hyperparameters for modeling neural network parameters"""
+      n_candidates = len(candidates)
+      n_parameters = len(parameters)
+      
+      # Extract hyperparameters into tensors for vectorized operations
+      nus = torch.tensor([params['nu'] for params in candidates], device=parameters.device, dtype=parameters.dtype)
+      sigma_scales = torch.tensor([params['sigma_scale'] for params in candidates], device=parameters.device, dtype=parameters.dtype)
       
       # Compute median-based sigma estimate (shared across all candidates)
-      med = torch.median(residuals.abs()).item() + 1e-12
+      med = torch.median(parameters.abs()).item() + 1e-12
       base_sigma = max(med / 0.6745, 1e-9)
       
       # Broadcast sigmas: shape [n_candidates]
       sigmas = base_sigma * sigma_scales
       
-      # Broadcast residuals for all candidates: shape [n_candidates, n_residuals] 
-      residuals_expanded = residuals.unsqueeze(0).expand(n_candidates, -1)
-      sigmas_expanded = sigmas.unsqueeze(1).expand(-1, n_residuals)  # shape [n_candidates, n_residuals]
-      nus_expanded = nus.unsqueeze(1).expand(-1, n_residuals)  # shape [n_candidates, n_residuals]
+      # Broadcast parameters for all candidates: shape [n_candidates, n_parameters] 
+      parameters_expanded = parameters.unsqueeze(0).expand(n_candidates, -1)
+      sigmas_expanded = sigmas.unsqueeze(1).expand(-1, n_parameters)  # shape [n_candidates, n_parameters]
+      nus_expanded = nus.unsqueeze(1).expand(-1, n_parameters)  # shape [n_candidates, n_parameters]
       
       # Vectorized Student-t log probability computation
-      # StudentT PDF: p(x) = Γ((ν+1)/2) / (√(νπ)·Γ(ν/2)·σ) · (1 + x²/(νσ²))^(-(ν+1)/2)
+      # StudentT PDF: p(w) = Γ((ν+1)/2) / (√(νπ)·Γ(ν/2)·σ) · (1 + w²/(νσ²))^(-(ν+1)/2)
       
-      # Standardized residuals: shape [n_candidates, n_residuals]
-      z = residuals_expanded / sigmas_expanded
+      # Standardized parameters: shape [n_candidates, n_parameters]
+      z = parameters_expanded / sigmas_expanded
       
       # Vectorized log probability computation
-      # log p(x) = log_gamma((ν+1)/2) - 0.5*log(νπ) - log_gamma(ν/2) - log(σ) - ((ν+1)/2)*log(1 + z²/ν)
+      # log p(w) = log_gamma((ν+1)/2) - 0.5*log(νπ) - log_gamma(ν/2) - log(σ) - ((ν+1)/2)*log(1 + w²/ν)
       log_gamma_half_nu_plus_1 = torch.lgamma((nus_expanded + 1) / 2)
       log_gamma_half_nu = torch.lgamma(nus_expanded / 2)
       log_sqrt_nu_pi = 0.5 * (torch.log(nus_expanded) + math.log(math.pi))
       log_sigma = torch.log(sigmas_expanded)
       log_one_plus_z_sq_over_nu = torch.log1p((z * z) / nus_expanded)
       
-      # Shape: [n_candidates, n_residuals]
+      # Shape: [n_candidates, n_parameters]
       log_probs = (log_gamma_half_nu_plus_1 - log_sqrt_nu_pi - log_gamma_half_nu 
                   - log_sigma - ((nus_expanded + 1) / 2) * log_one_plus_z_sq_over_nu)
       
-      # Sum log probabilities across residuals for each candidate: shape [n_candidates]
+      # Sum log probabilities across parameters for each candidate: shape [n_candidates]
       nll_bits = -log_probs.sum(dim=1) / math.log(2.0)  # Convert to bits
       
-      # Fixed hyperparameter encoding cost (independent of data size)
-      # Cost to encode ν and σ parameters with reasonable precision
-      param_bits_constant = 2.0 * math.log2(100)  # ~13 bits total for both parameters
+      # Fixed hyperparameter encoding cost (independent of parameter count)
+      # Cost to encode ν and σ hyperparameters with reasonable precision
+      hyperparameter_bits_constant = 2.0 * math.log2(100)  # ~13 bits total for both hyperparameters
       
-      # Discretization bits scale with data size (cost of quantizing residuals)
-      discretization_bits_constant = n_residuals * math.log2(1000.0)  # 1e-6 resolution
+      # Discretization bits scale with parameter count (cost of quantizing parameters)
+      discretization_bits_constant = n_parameters * math.log2(1000.0)  # 1e-6 resolution
       
       # Total bits for each candidate
-      scores = nll_bits + param_bits_constant + discretization_bits_constant
+      scores = nll_bits + hyperparameter_bits_constant + discretization_bits_constant
       
       return scores
+   def search_lambda_params(self, residuals, method='yeo-johnson'):
+      """Search for optimal transformation lambda using parallel SA"""
+      if self.lambda_sampler is None:
+         self.lambda_sampler = ParallelAdaptiveAnnealingSampler(
+             n_parallel=self.adaptive_batch_size(len(residuals)),
+             param_bounds={'lambda': (-2.0, 2.0)}
+         )
+      
+      candidates = self.lambda_sampler.sample_candidates()
+      scores = self._evaluate_lambda_candidates(residuals, candidates, method)
+      best_params, accepted = self.lambda_sampler.update_and_accept(candidates, scores)
+      
+      return best_params['lambda']
    def _evaluate_lambda_candidates(self, residuals, candidates, method):
-      """Parallel evaluation of lambda parameter candidates using vectorized operations where possible"""
+      """Parallel evaluation of lambda hyperparameters for transforming prediction residuals"""
       n_candidates = len(candidates)
       n_residuals = len(residuals)
       
@@ -268,7 +266,7 @@ class MDLParallelHyperparameterSearch:
                c = float(torch.clamp(-(residuals.min()) + 1e-6, min=1e-9).item())
                t, logabsdet_nat = self._bc_transform_and_logabsdet_jac(residuals, lam, c)
             
-            # Mean-center
+            # Mean-center transformed residuals
             t = t - t.mean()
             transformed_list.append(t)
             logabsdet_list.append(logabsdet_nat)
@@ -283,23 +281,23 @@ class MDLParallelHyperparameterSearch:
          transformed_stack = torch.stack(transformed_list, dim=0)
          logabsdet_stack = torch.stack(logabsdet_list, dim=0)
          
-         # Vectorized variance computation
+         # Vectorized variance computation for transformed residuals
          var_t = torch.var(transformed_stack, dim=1, unbiased=False).clamp_min(1e-12)
          
-         # Vectorized gaussian bits computation
+         # Vectorized gaussian bits computation for residuals
          bits_gauss = 0.5 * n_residuals * math.log2(2.0 * math.pi * math.e) + 0.5 * n_residuals * torch.log2(var_t)
          bits_jac = -(logabsdet_stack / math.log(2.0))
          
-         # Fixed hyperparameter encoding cost (independent of data size)
-         param_bits_constant = math.log2(100)  # ~6.6 bits for λ parameter
-         # Box-cox offset c adds another parameter if needed
+         # Fixed hyperparameter encoding cost (independent of residual count)
+         hyperparameter_bits_constant = math.log2(100)  # ~6.6 bits for λ hyperparameter
+         # Box-cox offset c adds another hyperparameter if needed
          if method == "box-cox":
-            param_bits_constant += math.log2(100)  # Another ~6.6 bits for c
+            hyperparameter_bits_constant += math.log2(100)  # Another ~6.6 bits for c hyperparameter
             
-         # Discretization bits scale with data size (cost of quantizing residuals)
+         # Discretization bits scale with residual count (cost of quantizing residuals)
          discretization_bits_constant = n_residuals * math.log2(1000.0)  # 1e-6 resolution
          
-         total_bits = bits_gauss + bits_jac + param_bits_constant + discretization_bits_constant
+         total_bits = bits_gauss + bits_jac + hyperparameter_bits_constant + discretization_bits_constant
          
          # Only update valid candidates
          scores[valid_mask] = total_bits[valid_mask]
