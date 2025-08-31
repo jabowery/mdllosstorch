@@ -55,23 +55,6 @@ def test_larger_model_higher_mdl():
     assert mdl_big > mdl_small
 
 
-def test_component_additivity():
-    torch.manual_seed(0)
-    model = torch.nn.Linear(10, 10)
-    x = torch.randn(64, 10)
-    yhat = torch.randn(64, 10)
-
-    loss = MDLLoss()
-    total = loss(x, yhat, model)
-
-    lam_grid = torch.linspace(-2.0, 2.0, 81, device=x.device, dtype=x.dtype)
-    res = residual_bits_transformed_gradsafe(
-        x, yhat, lam_grid=lam_grid, method="yeo-johnson", data_resolution=1e-6
-    )
-    par = parameter_bits_model_student_t(model, param_resolution=1e-6)
-    assert torch.allclose(total, res + par, atol=1e-4, rtol=1e-5)
-
-
 def test_gradient_flow():
     torch.manual_seed(0)
     model = torch.nn.Linear(10, 10)
@@ -87,3 +70,21 @@ def test_gradient_flow():
         p.grad is not None and torch.isfinite(p.grad).any() for p in model.parameters()
     )
     assert has_grad
+def test_component_additivity():
+    torch.manual_seed(0)
+    model = torch.nn.Linear(10, 10)
+    x = torch.randn(64, 10)
+    yhat = torch.randn(64, 10)
+
+    # Use transform-based coder to match manual component calculation
+    loss = MDLLoss(coder="yeo-johnson", method="yeo-johnson", data_resolution=1e-6, param_resolution=1e-6)
+    total = loss(x, yhat, model)
+
+    lam_grid = torch.linspace(-2.0, 2.0, 81, device=x.device, dtype=x.dtype)
+    res = residual_bits_transformed_gradsafe(
+        x, yhat, lam_grid=lam_grid, method="yeo-johnson", data_resolution=1e-6
+    )
+    par = parameter_bits_model_student_t(model, param_resolution=1e-6)
+    
+    expected_total = res + par
+    assert torch.allclose(total, expected_total, atol=1e-4, rtol=1e-5), f"Total: {total.item():.6f}, Expected: {expected_total.item():.6f}, Diff: {abs(total.item() - expected_total.item()):.6f}"
