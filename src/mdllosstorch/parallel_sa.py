@@ -101,13 +101,6 @@ class ParallelAdaptiveAnnealingSampler:
 
 class MDLParallelHyperparameterSearch:
    """Efficient hyperparameter search for MDL loss using parallel SA"""
-   
-   def __init__(self, n_parallel=32, memory_limit_mb=1000):
-       self.n_parallel = n_parallel
-       self.memory_limit_mb = memory_limit_mb
-       self.param_sampler = None
-       self.lambda_sampler = None
-       
    def estimate_memory_usage(self, n_residuals):
        """Estimate memory usage for parallel evaluation"""
        bytes_per_float = 4
@@ -158,7 +151,12 @@ class MDLParallelHyperparameterSearch:
        
        logabsdet = (lam - 1.0) * torch.log(z).sum()
        return t, logabsdet
-   def search_student_t_params(self, parameters):
+   def __init__(self, n_parallel=8, memory_limit_mb=100):
+      self.n_parallel = n_parallel
+      self.memory_limit_mb = memory_limit_mb
+      self.param_sampler = None
+      self.lambda_sampler = None
+   def search_student_t_params(self, parameters, param_resolution=1e-6):
       """Search for optimal Student-t parameters using parallel SA"""
       if self.param_sampler is None:
          self.param_sampler = ParallelAdaptiveAnnealingSampler(
@@ -171,11 +169,24 @@ class MDLParallelHyperparameterSearch:
          )
       
       candidates = self.param_sampler.sample_candidates()
-      scores = self._evaluate_student_t_candidates(parameters, candidates)
+      scores = self._evaluate_student_t_candidates(parameters, candidates, param_resolution)
       best_params, accepted = self.param_sampler.update_and_accept(candidates, scores)
       
       return best_params['nu'], best_params['sigma_scale']
-   def _evaluate_student_t_candidates(self, parameters, candidates):
+   def search_lambda_params(self, residuals, method='yeo-johnson', data_resolution=1e-6):
+      """Search for optimal transformation lambda using parallel SA"""
+      if self.lambda_sampler is None:
+         self.lambda_sampler = ParallelAdaptiveAnnealingSampler(
+             n_parallel=self.adaptive_batch_size(len(residuals)),
+             param_bounds={'lambda': (-2.0, 2.0)}
+         )
+      
+      candidates = self.lambda_sampler.sample_candidates()
+      scores = self._evaluate_lambda_candidates(residuals, candidates, method, data_resolution)
+      best_params, accepted = self.lambda_sampler.update_and_accept(candidates, scores)
+      
+      return best_params['lambda']
+   def _evaluate_student_t_candidates(self, parameters, candidates, param_resolution):
       """Parallel evaluation of Student-t hyperparameters for modeling neural network parameters"""
       n_candidates = len(candidates)
       n_parameters = len(parameters)
@@ -221,27 +232,14 @@ class MDLParallelHyperparameterSearch:
       # Cost to encode ν and σ hyperparameters with reasonable precision
       hyperparameter_bits_constant = 2.0 * math.log2(100)  # ~13 bits total for both hyperparameters
       
-      # Discretization bits scale with parameter count (cost of quantizing parameters)
-      discretization_bits_constant = n_parameters * math.log2(1000.0)  # 1e-6 resolution
+      # Discretization bits scale with parameter count using user-specified resolution
+      discretization_bits_constant = n_parameters * math.log2(1.0 / param_resolution)
       
       # Total bits for each candidate
       scores = nll_bits + hyperparameter_bits_constant + discretization_bits_constant
       
       return scores
-   def search_lambda_params(self, residuals, method='yeo-johnson'):
-      """Search for optimal transformation lambda using parallel SA"""
-      if self.lambda_sampler is None:
-         self.lambda_sampler = ParallelAdaptiveAnnealingSampler(
-             n_parallel=self.adaptive_batch_size(len(residuals)),
-             param_bounds={'lambda': (-2.0, 2.0)}
-         )
-      
-      candidates = self.lambda_sampler.sample_candidates()
-      scores = self._evaluate_lambda_candidates(residuals, candidates, method)
-      best_params, accepted = self.lambda_sampler.update_and_accept(candidates, scores)
-      
-      return best_params['lambda']
-   def _evaluate_lambda_candidates(self, residuals, candidates, method):
+   def _evaluate_lambda_candidates(self, residuals, candidates, method, data_resolution):
       """Parallel evaluation of lambda hyperparameters for transforming prediction residuals"""
       n_candidates = len(candidates)
       n_residuals = len(residuals)
@@ -294,8 +292,8 @@ class MDLParallelHyperparameterSearch:
          if method == "box-cox":
             hyperparameter_bits_constant += math.log2(100)  # Another ~6.6 bits for c hyperparameter
             
-         # Discretization bits scale with residual count (cost of quantizing residuals)
-         discretization_bits_constant = n_residuals * math.log2(1000.0)  # 1e-6 resolution
+         # Discretization bits scale with residual count using user-specified resolution
+         discretization_bits_constant = n_residuals * math.log2(1.0 / data_resolution)
          
          total_bits = bits_gauss + bits_jac + hyperparameter_bits_constant + discretization_bits_constant
          

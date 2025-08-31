@@ -3,19 +3,36 @@ import torch
 from torch.distributions import StudentT
 
 _LOG2E = 1.0 / math.log(2.0)
-def parameter_bits_student_t_gradsafe(
-   w: torch.Tensor,
+def parameter_bits_model_student_t(
+   model: torch.nn.Module,
    include_param_bits: bool = True,
    param_resolution: float = 1e-6,
-   nu_grid=(1.5, 2, 3, 5, 8, 16, 32, 64),
-   sigma_scales=(0.25, 0.5, 1.0, 2.0, 4.0),
    use_parallel_sa: bool = False,
 ) -> torch.Tensor:
+    """Sum of Student-t parameter bits over all model parameters that require grad."""
+    device = next((p.device for p in model.parameters()), torch.device("cpu"))
+    total = torch.tensor(0.0, device=device)
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        total = total + parameter_bits_student_t_gradsafe(
+            p, include_param_bits=include_param_bits, param_resolution=param_resolution,
+            use_parallel_sa=use_parallel_sa
+        )
+    return total
+def parameter_bits_student_t_gradsafe(
+    w: torch.Tensor,
+    include_param_bits: bool = True,
+    param_resolution: float = 1e-6,
+    nu_grid=(1.5, 2, 3, 5, 8, 16, 32, 64),
+    sigma_scales=(0.25, 0.5, 1.0, 2.0, 4.0),
+    use_parallel_sa: bool = False,
+) -> torch.Tensor:
     """MDL bits for a parameter tensor under a Student-t(nu, sigma) prior.
-   
-   Args:
-       use_parallel_sa: If True, use parallel simulated annealing instead of grid search
-   """
+    
+    Args:
+        use_parallel_sa: If True, use parallel simulated annealing instead of grid search
+    """
     x = w.flatten()
     x = x[torch.isfinite(x)]
     n = x.numel()
@@ -31,7 +48,7 @@ def parameter_bits_student_t_gradsafe(
         
         with torch.no_grad():
             xd = x.detach()
-            nu_star, sigma_scale = parameter_bits_student_t_gradsafe._sa_search.search_student_t_params(xd)
+            nu_star, sigma_scale = parameter_bits_student_t_gradsafe._sa_search.search_student_t_params(xd, param_resolution)
             med = torch.median(xd.abs()).item() + 1e-12
             sigma_star = max(med / 0.6745, 1e-9) * sigma_scale
     else:
@@ -63,20 +80,3 @@ def parameter_bits_student_t_gradsafe(
         bits = bits + 0.5 * math.log2(max(2, n)) + 0.5 * math.log2(max(2, n))
     bits = bits + n * math.log2(1.0 / param_resolution)
     return bits
-def parameter_bits_model_student_t(
-   model: torch.nn.Module,
-   include_param_bits: bool = True,
-   param_resolution: float = 1e-6,
-   use_parallel_sa: bool = False,
-) -> torch.Tensor:
-    """Sum of Student-t parameter bits over all model parameters that require grad."""
-    device = next((p.device for p in model.parameters()), torch.device("cpu"))
-    total = torch.tensor(0.0, device=device)
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        total = total + parameter_bits_student_t_gradsafe(
-            p, include_param_bits=include_param_bits, param_resolution=param_resolution,
-            use_parallel_sa=use_parallel_sa
-        )
-    return total

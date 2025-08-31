@@ -136,20 +136,20 @@ def gauss_nml_bits(
     total_bits = diff_bits + q_const + penalty_sigma
     return total_bits
 def residual_bits_transformed_gradsafe(
-   original: torch.Tensor,
-   reconstructed: torch.Tensor,
-   lam_grid: torch.Tensor = None,
-   method: str = "yeo-johnson",
-   offset_c: float = None,
-   include_param_bits: bool = True,
-   data_resolution: float = 1e-6,
-   use_parallel_sa: bool = False,
+    original: torch.Tensor,
+    reconstructed: torch.Tensor,
+    lam_grid: torch.Tensor = None,
+    method: str = "yeo-johnson",
+    offset_c: float = None,
+    include_param_bits: bool = True,
+    data_resolution: float = 1e-6,
+    use_parallel_sa: bool = False,
 ) -> torch.Tensor:
     """MDL residual bits with Yeo-Johnson/Box-Cox, Jacobian, lambda bits, and discretization.
-   
-   Args:
-       use_parallel_sa: If True, use parallel simulated annealing instead of grid search
-   """
+    
+    Args:
+        use_parallel_sa: If True, use parallel simulated annealing instead of grid search
+    """
     r_full = (original - reconstructed).flatten()
     mask = torch.isfinite(r_full)
     if not mask.any():
@@ -165,7 +165,7 @@ def residual_bits_transformed_gradsafe(
         
         with torch.no_grad():
             rd = r.detach()
-            lam_star = residual_bits_transformed_gradsafe._sa_search.search_lambda_params(rd, method)
+            lam_star = residual_bits_transformed_gradsafe._sa_search.search_lambda_params(rd, method, data_resolution)
             if method == "box-cox" and offset_c is None:
                 c_star = float(torch.clamp(-(rd.min()) + 1e-6, min=1e-9).item())
             else:
