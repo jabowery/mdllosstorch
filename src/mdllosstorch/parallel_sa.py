@@ -240,64 +240,144 @@ class MDLParallelHyperparameterSearch:
       
       return scores
    def _evaluate_lambda_candidates(self, residuals, candidates, method, data_resolution):
-      """Parallel evaluation of lambda hyperparameters for transforming prediction residuals"""
+      """Fully parallel evaluation of lambda hyperparameters using vectorized transformations"""
       n_candidates = len(candidates)
       n_residuals = len(residuals)
       
-      # Extract lambdas into tensor
+      # Extract lambdas into tensor: shape [n_candidates]
       lambdas = torch.tensor([params['lambda'] for params in candidates], device=residuals.device, dtype=residuals.dtype)
       
-      # Initialize scores tensor
-      scores = torch.full((n_candidates,), float('inf'), device=residuals.device, dtype=residuals.dtype)
+      # Broadcast residuals and lambdas: shape [n_candidates, n_residuals]
+      residuals_expanded = residuals.unsqueeze(0).expand(n_candidates, -1)
+      lambdas_expanded = lambdas.unsqueeze(1).expand(-1, n_residuals)
       
-      # Process each lambda (transformation logic has conditional branches that are hard to vectorize)
-      # But we can still batch the final computations
-      transformed_list = []
-      logabsdet_list = []
-      valid_mask = torch.ones(n_candidates, dtype=torch.bool, device=residuals.device)
+      if method == 'yeo-johnson':
+         # Vectorized Yeo-Johnson transformation
+         transformed_stack, logabsdet_stack = self._vectorized_yj_transform(residuals_expanded, lambdas_expanded)
+      elif method == 'box-cox':
+         # Vectorized Box-Cox transformation
+         transformed_stack, logabsdet_stack = self._vectorized_bc_transform(residuals_expanded, lambdas_expanded)
+      else:
+         raise ValueError(f"Unsupported method: {method}")
       
-      for i, lam in enumerate(lambdas.tolist()):
-         try:
-            if method == 'yeo-johnson':
-               t, logabsdet_nat = self._yj_transform_and_logabsdet_jac(residuals, lam)
-            else:  # box-cox
-               c = float(torch.clamp(-(residuals.min()) + 1e-6, min=1e-9).item())
-               t, logabsdet_nat = self._bc_transform_and_logabsdet_jac(residuals, lam, c)
-            
-            # Mean-center transformed residuals
-            t = t - t.mean()
-            transformed_list.append(t)
-            logabsdet_list.append(logabsdet_nat)
-            
-         except Exception:
-            valid_mask[i] = False
-            transformed_list.append(torch.zeros_like(residuals))  # placeholder
-            logabsdet_list.append(torch.tensor(0.0, device=residuals.device))
+      # Mean-center each transformed candidate: shape [n_candidates, n_residuals]
+      transformed_centered = transformed_stack - transformed_stack.mean(dim=1, keepdim=True)
       
-      if valid_mask.any():
-         # Stack all valid transformations: shape [n_candidates, n_residuals]
-         transformed_stack = torch.stack(transformed_list, dim=0)
-         logabsdet_stack = torch.stack(logabsdet_list, dim=0)
-         
-         # Vectorized variance computation for transformed residuals
-         var_t = torch.var(transformed_stack, dim=1, unbiased=False).clamp_min(1e-12)
-         
-         # Vectorized gaussian bits computation for residuals
-         bits_gauss = 0.5 * n_residuals * math.log2(2.0 * math.pi * math.e) + 0.5 * n_residuals * torch.log2(var_t)
-         bits_jac = -(logabsdet_stack / math.log(2.0))
-         
-         # Fixed hyperparameter encoding cost (independent of residual count)
-         hyperparameter_bits_constant = math.log2(100)  # ~6.6 bits for λ hyperparameter
-         # Box-cox offset c adds another hyperparameter if needed
-         if method == "box-cox":
-            hyperparameter_bits_constant += math.log2(100)  # Another ~6.6 bits for c hyperparameter
-            
-         # Discretization bits scale with residual count using user-specified resolution
-         discretization_bits_constant = n_residuals * math.log2(1.0 / data_resolution)
-         
-         total_bits = bits_gauss + bits_jac + hyperparameter_bits_constant + discretization_bits_constant
-         
-         # Only update valid candidates
-         scores[valid_mask] = total_bits[valid_mask]
+      # Vectorized variance computation: shape [n_candidates]
+      var_t = torch.var(transformed_centered, dim=1, unbiased=False).clamp_min(1e-12)
       
-      return scores
+      # Vectorized bits computation
+      bits_gauss = 0.5 * n_residuals * math.log2(2.0 * math.pi * math.e) + 0.5 * n_residuals * torch.log2(var_t)
+      bits_jac = -(logabsdet_stack / math.log(2.0))
+      
+      # Fixed hyperparameter encoding cost (independent of residual count)
+      hyperparameter_bits_constant = math.log2(100)  # ~6.6 bits for λ hyperparameter
+      if method == "box-cox":
+         hyperparameter_bits_constant += math.log2(100)  # Another ~6.6 bits for c hyperparameter
+         
+      # Discretization bits using user-specified resolution
+      discretization_bits_constant = n_residuals * math.log2(1.0 / data_resolution)
+      
+      total_bits = bits_gauss + bits_jac + hyperparameter_bits_constant + discretization_bits_constant
+      
+      return total_bits
+   def _vectorized_yj_transform(self, residuals_expanded, lambdas_expanded):
+      """Vectorized Yeo-Johnson transformation for all candidates simultaneously"""
+      # residuals_expanded: [n_candidates, n_residuals]
+      # lambdas_expanded: [n_candidates, n_residuals]
+      
+      # Split into positive and negative masks
+      positive_mask = residuals_expanded >= 0
+      negative_mask = ~positive_mask
+      
+      # Initialize output tensors
+      transformed = torch.zeros_like(residuals_expanded)
+      logabsdet_total = torch.zeros(residuals_expanded.shape[0], device=residuals_expanded.device, dtype=residuals_expanded.dtype)
+      
+      # Handle positive values: T(r) = ((r+1)^λ - 1) / λ if λ≠0, else log(r+1)
+      if positive_mask.any():
+         r_pos = residuals_expanded[positive_mask]
+         lam_pos = lambdas_expanded[positive_mask]
+         
+         # Separate λ=0 and λ≠0 cases
+         lam_zero_mask = torch.abs(lam_pos) < 1e-10
+         lam_nonzero_mask = ~lam_zero_mask
+         
+         if lam_zero_mask.any():
+            transformed[positive_mask][lam_zero_mask] = torch.log1p(r_pos[lam_zero_mask])
+         
+         if lam_nonzero_mask.any():
+            r_nz = r_pos[lam_nonzero_mask]
+            lam_nz = lam_pos[lam_nonzero_mask]
+            transformed[positive_mask][lam_nonzero_mask] = ((r_nz + 1.0) ** lam_nz - 1.0) / lam_nz
+         
+         # Jacobian for positive values: (λ-1) * log(r+1)
+         logabsdet_pos = (lambdas_expanded[positive_mask] - 1.0) * torch.log1p(r_pos)
+         # Sum across residuals for each candidate
+         for i in range(residuals_expanded.shape[0]):
+            mask_i = positive_mask[i]
+            if mask_i.any():
+               logabsdet_total[i] += logabsdet_pos[positive_mask[i]].sum()
+      
+      # Handle negative values: T(r) = -(((1-r)^(2-λ) - 1) / (2-λ)) if 2-λ≠0, else -log(1-r)
+      if negative_mask.any():
+         r_neg = residuals_expanded[negative_mask]
+         lam_neg = lambdas_expanded[negative_mask]
+         lam2 = 2.0 - lam_neg
+         
+         # Separate (2-λ)=0 and (2-λ)≠0 cases
+         lam2_zero_mask = torch.abs(lam2) < 1e-10
+         lam2_nonzero_mask = ~lam2_zero_mask
+         
+         if lam2_zero_mask.any():
+            transformed[negative_mask][lam2_zero_mask] = -torch.log1p(-r_neg[lam2_zero_mask])
+         
+         if lam2_nonzero_mask.any():
+            r_nz = r_neg[lam2_nonzero_mask]
+            lam2_nz = lam2[lam2_nonzero_mask]
+            transformed[negative_mask][lam2_nonzero_mask] = -(((1.0 - r_nz) ** lam2_nz - 1.0) / lam2_nz)
+         
+         # Jacobian for negative values: (1-λ) * log(1-r)
+         logabsdet_neg = (1.0 - lambdas_expanded[negative_mask]) * torch.log1p(-r_neg)
+         # Sum across residuals for each candidate
+         for i in range(residuals_expanded.shape[0]):
+            mask_i = negative_mask[i]
+            if mask_i.any():
+               logabsdet_total[i] += logabsdet_neg[negative_mask[i]].sum()
+      
+      return transformed, logabsdet_total
+   def _vectorized_bc_transform(self, residuals_expanded, lambdas_expanded):
+      """Vectorized Box-Cox transformation for all candidates simultaneously"""
+      # residuals_expanded: [n_candidates, n_residuals]
+      # lambdas_expanded: [n_candidates, n_residuals]
+      
+      # Compute offset for each candidate (to ensure positivity)
+      # c = max(0, -min(residuals) + ε) for each candidate
+      min_per_candidate = residuals_expanded.min(dim=1, keepdim=True)[0]  # [n_candidates, 1]
+      c_per_candidate = torch.clamp(-min_per_candidate + 1e-6, min=1e-9)  # [n_candidates, 1]
+      
+      # Apply offset: z = r + c
+      z = residuals_expanded + c_per_candidate
+      z = torch.clamp(z, min=1e-9)  # Ensure positivity
+      
+      # Box-Cox transformation: T(z) = (z^λ - 1) / λ if λ≠0, else log(z)
+      lam_zero_mask = torch.abs(lambdas_expanded) < 1e-10
+      lam_nonzero_mask = ~lam_zero_mask
+      
+      transformed = torch.zeros_like(z)
+      
+      # λ = 0 case
+      if lam_zero_mask.any():
+         transformed[lam_zero_mask] = torch.log(z[lam_zero_mask])
+      
+      # λ ≠ 0 case
+      if lam_nonzero_mask.any():
+         z_nz = z[lam_nonzero_mask]
+         lam_nz = lambdas_expanded[lam_nonzero_mask]
+         transformed[lam_nonzero_mask] = (z_nz ** lam_nz - 1.0) / lam_nz
+      
+      # Jacobian: (λ-1) * log(z), summed over residuals for each candidate
+      logabsdet_per_element = (lambdas_expanded - 1.0) * torch.log(z)
+      logabsdet_total = logabsdet_per_element.sum(dim=1)  # [n_candidates]
+      
+      return transformed, logabsdet_total
