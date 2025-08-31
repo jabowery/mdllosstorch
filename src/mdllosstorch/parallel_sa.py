@@ -63,38 +63,40 @@ class ParallelAdaptiveAnnealingSampler:
        )
        
        return {'nu': float(nu), 'sigma_scale': float(sigma_scale), 'lambda': float(lambda_val)}
-
    def update_and_accept(self, candidates, scores):
-       """Update best solution using Metropolis acceptance criterion"""
-       best_idx = torch.argmin(scores)
-       best_candidate = candidates[best_idx]
-       best_score = float(scores[best_idx])
-       
-       # Always accept improvements
-       if best_score < self.current_best_score:
-           self.current_best = best_candidate
-           self.current_best_score = best_score
-           accepted = True
-       else:
-           # Probabilistic acceptance for worse solutions
-           delta = best_score - self.current_best_score
-           accept_prob = torch.exp(-delta / max(self.temperature, 1e-10))
-           if torch.rand(1) < accept_prob:
-               self.current_best = best_candidate
-               self.current_best_score = best_score
-               accepted = True
-           else:
-               accepted = False
-       
-       # Cool down temperature
-       self.temperature *= self.cooling_rate
-       self.iteration_count += 1
-       
-       # Reheat if temperature gets too low (adaptive restart)
-       if self.temperature < 0.01 and self.iteration_count % 50 == 0:
-           self.temperature = self.initial_temp * 0.5
-       
-       return self.current_best, accepted
+      """Update best solution using Metropolis acceptance criterion"""
+      best_idx = torch.argmin(scores)
+      best_candidate = candidates[best_idx]
+      best_score = float(scores[best_idx])
+      
+      # Always accept improvements
+      if best_score < self.current_best_score:
+         self.current_best = best_candidate
+         self.current_best_score = best_score
+         accepted = True
+      else:
+         # Probabilistic acceptance for worse solutions
+         delta = best_score - self.current_best_score
+         # Ensure we work with tensors for torch.exp()
+         delta_tensor = torch.tensor(delta, dtype=scores.dtype, device=scores.device)
+         temp_tensor = torch.tensor(max(self.temperature, 1e-10), dtype=scores.dtype, device=scores.device)
+         accept_prob = torch.exp(-delta_tensor / temp_tensor)
+         if torch.rand(1, device=scores.device) < accept_prob:
+            self.current_best = best_candidate
+            self.current_best_score = best_score
+            accepted = True
+         else:
+            accepted = False
+      
+      # Cool down temperature
+      self.temperature *= self.cooling_rate
+      self.iteration_count += 1
+      
+      # Reheat if temperature gets too low (adaptive restart)
+      if self.temperature < 0.01 and self.iteration_count % 50 == 0:
+         self.temperature = self.initial_temp * 0.5
+      
+      return self.current_best, accepted
 
 
 class MDLParallelHyperparameterSearch:
