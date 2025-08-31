@@ -232,8 +232,11 @@ class MDLParallelHyperparameterSearch:
       # Sum log probabilities across residuals for each candidate: shape [n_candidates]
       nll_bits = -log_probs.sum(dim=1) / math.log(2.0)  # Convert to bits
       
-      # Scalar constants (same for all candidates, computed once)
-      param_bits_constant = 0.5 * math.log2(max(2, n_residuals)) + 0.5 * math.log2(max(2, n_residuals))
+      # Fixed hyperparameter encoding cost (independent of data size)
+      # Cost to encode ν and σ parameters with reasonable precision
+      param_bits_constant = 2.0 * math.log2(100)  # ~13 bits total for both parameters
+      
+      # Discretization bits scale with data size (cost of quantizing residuals)
       discretization_bits_constant = n_residuals * math.log2(1000.0)  # 1e-6 resolution
       
       # Total bits for each candidate
@@ -287,8 +290,13 @@ class MDLParallelHyperparameterSearch:
          bits_gauss = 0.5 * n_residuals * math.log2(2.0 * math.pi * math.e) + 0.5 * n_residuals * torch.log2(var_t)
          bits_jac = -(logabsdet_stack / math.log(2.0))
          
-         # Scalar constants (same for all candidates)
-         param_bits_constant = 0.5 * math.log2(max(2, n_residuals))
+         # Fixed hyperparameter encoding cost (independent of data size)
+         param_bits_constant = math.log2(100)  # ~6.6 bits for λ parameter
+         # Box-cox offset c adds another parameter if needed
+         if method == "box-cox":
+            param_bits_constant += math.log2(100)  # Another ~6.6 bits for c
+            
+         # Discretization bits scale with data size (cost of quantizing residuals)
          discretization_bits_constant = n_residuals * math.log2(1000.0)  # 1e-6 resolution
          
          total_bits = bits_gauss + bits_jac + param_bits_constant + discretization_bits_constant
