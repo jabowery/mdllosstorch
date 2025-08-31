@@ -217,7 +217,7 @@ class MDLParallelHyperparameterSearch:
       # Standardized residuals: shape [n_candidates, n_residuals]
       z = residuals_expanded / sigmas_expanded
       
-      # Log probability computation (vectorized)
+      # Vectorized log probability computation
       # log p(x) = log_gamma((ν+1)/2) - 0.5*log(νπ) - log_gamma(ν/2) - log(σ) - ((ν+1)/2)*log(1 + z²/ν)
       log_gamma_half_nu_plus_1 = torch.lgamma((nus_expanded + 1) / 2)
       log_gamma_half_nu = torch.lgamma(nus_expanded / 2)
@@ -232,16 +232,16 @@ class MDLParallelHyperparameterSearch:
       # Sum log probabilities across residuals for each candidate: shape [n_candidates]
       nll_bits = -log_probs.sum(dim=1) / math.log(2.0)  # Convert to bits
       
-      # Add parameter encoding bits (vectorized)
-      param_bits = 0.5 * math.log2(max(2, n_residuals)) + 0.5 * math.log2(max(2, n_residuals))
-      discretization_bits = n_residuals * math.log2(1000.0)  # 1e-6 resolution
+      # Scalar constants (same for all candidates, computed once)
+      param_bits_constant = 0.5 * math.log2(max(2, n_residuals)) + 0.5 * math.log2(max(2, n_residuals))
+      discretization_bits_constant = n_residuals * math.log2(1000.0)  # 1e-6 resolution
       
       # Total bits for each candidate
-      scores = nll_bits + param_bits + discretization_bits
+      scores = nll_bits + param_bits_constant + discretization_bits_constant
       
       return scores
    def _evaluate_lambda_candidates(self, residuals, candidates, method):
-      """Parallel evaluation of lambda parameter candidates using vectorized operations"""
+      """Parallel evaluation of lambda parameter candidates using vectorized operations where possible"""
       n_candidates = len(candidates)
       n_residuals = len(residuals)
       
@@ -251,7 +251,7 @@ class MDLParallelHyperparameterSearch:
       # Initialize scores tensor
       scores = torch.full((n_candidates,), float('inf'), device=residuals.device, dtype=residuals.dtype)
       
-      # Process each lambda (some operations are hard to vectorize due to conditional logic)
+      # Process each lambda (transformation logic has conditional branches that are hard to vectorize)
       # But we can still batch the final computations
       transformed_list = []
       logabsdet_list = []
@@ -280,16 +280,18 @@ class MDLParallelHyperparameterSearch:
          transformed_stack = torch.stack(transformed_list, dim=0)
          logabsdet_stack = torch.stack(logabsdet_list, dim=0)
          
-         # Vectorized variance computation (with safety clamp)
+         # Vectorized variance computation
          var_t = torch.var(transformed_stack, dim=1, unbiased=False).clamp_min(1e-12)
          
-         # Vectorized bits computation
+         # Vectorized gaussian bits computation
          bits_gauss = 0.5 * n_residuals * math.log2(2.0 * math.pi * math.e) + 0.5 * n_residuals * torch.log2(var_t)
          bits_jac = -(logabsdet_stack / math.log(2.0))
-         bits_param = 0.5 * math.log2(max(2, n_residuals))
-         bits_disc = n_residuals * math.log2(1000.0)  # 1e-6 resolution
          
-         total_bits = bits_gauss + bits_jac + bits_param + bits_disc
+         # Scalar constants (same for all candidates)
+         param_bits_constant = 0.5 * math.log2(max(2, n_residuals))
+         discretization_bits_constant = n_residuals * math.log2(1000.0)  # 1e-6 resolution
+         
+         total_bits = bits_gauss + bits_jac + param_bits_constant + discretization_bits_constant
          
          # Only update valid candidates
          scores[valid_mask] = total_bits[valid_mask]
