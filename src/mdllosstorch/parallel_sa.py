@@ -6,7 +6,7 @@ from torch.distributions import StudentT
 class ParallelAdaptiveAnnealingSampler:
    """Parallel adaptive simulated annealing for hyperparameter search in MDL loss"""
    
-   def __init__(self, n_parallel=8, initial_temp=1.0, cooling_rate=0.95, param_bounds=None):
+   def __init__(self, n_parallel=32, initial_temp=1.0, cooling_rate=0.95, param_bounds=None):
        self.n_parallel = n_parallel
        self.temperature = initial_temp
        self.initial_temp = initial_temp
@@ -102,7 +102,7 @@ class ParallelAdaptiveAnnealingSampler:
 class MDLParallelHyperparameterSearch:
    """Efficient hyperparameter search for MDL loss using parallel SA"""
    
-   def __init__(self, n_parallel=8, memory_limit_mb=100):
+   def __init__(self, n_parallel=32, memory_limit_mb=1000):
        self.n_parallel = n_parallel
        self.memory_limit_mb = memory_limit_mb
        self.param_sampler = None
@@ -154,63 +154,6 @@ class MDLParallelHyperparameterSearch:
        
        return best_params['lambda']
    
-   def _evaluate_student_t_candidates(self, residuals, candidates):
-       """Parallel evaluation of Student-t parameter candidates"""
-       scores = torch.zeros(len(candidates), device=residuals.device)
-       
-       for i, params in enumerate(candidates):
-           nu, sigma_scale = params['nu'], params['sigma_scale']
-           
-           # Compute median-based sigma estimate
-           med = torch.median(residuals.abs()).item() + 1e-12
-           sigma = max(med / 0.6745, 1e-9) * sigma_scale
-           
-           # Evaluate Student-t NLL + parameter bits
-           dist = StudentT(df=float(nu), loc=0.0, scale=1.0)
-           nll_nat = -dist.log_prob(residuals / sigma).sum() + len(residuals) * math.log(sigma)
-           bits = nll_nat / math.log(2.0)
-           
-           # Add parameter encoding bits
-           n = len(residuals)
-           param_bits = 0.5 * math.log2(max(2, n)) + 0.5 * math.log2(max(2, n))
-           discretization_bits = n * math.log2(1000.0)  # 1e-6 resolution
-           
-           scores[i] = bits + param_bits + discretization_bits
-       
-       return scores
-   
-   def _evaluate_lambda_candidates(self, residuals, candidates, method):
-       """Parallel evaluation of lambda parameter candidates"""
-       scores = torch.zeros(len(candidates), device=residuals.device)
-       
-       for i, params in enumerate(candidates):
-           lam = params['lambda']
-           
-           try:
-               if method == 'yeo-johnson':
-                   t, logabsdet_nat = self._yj_transform_and_logabsdet_jac(residuals, lam)
-               else:  # box-cox
-                   c = float(torch.clamp(-(residuals.min()) + 1e-6, min=1e-9).item())
-                   t, logabsdet_nat = self._bc_transform_and_logabsdet_jac(residuals, lam, c)
-               
-               # Mean-center and compute variance
-               t = t - t.mean()
-               var_t = torch.var(t, unbiased=False).clamp_min(1e-12)
-               
-               # Compute total bits
-               n = len(t)
-               bits_gauss = 0.5 * n * math.log2(2.0 * math.pi * math.e) + 0.5 * n * math.log2(var_t)
-               bits_jac = -(logabsdet_nat / math.log(2.0))
-               bits_param = 0.5 * math.log2(max(2, n))
-               bits_disc = n * math.log2(1000.0)  # 1e-6 resolution
-               
-               scores[i] = bits_gauss + bits_jac + bits_param + bits_disc
-               
-           except Exception:
-               scores[i] = float('inf')  # Invalid parameter
-       
-       return scores
-   
    def _yj_transform_and_logabsdet_jac(self, r, lam):
        """Yeo-Johnson transform with Jacobian determinant"""
        rp = r >= 0
@@ -247,3 +190,108 @@ class MDLParallelHyperparameterSearch:
        
        logabsdet = (lam - 1.0) * torch.log(z).sum()
        return t, logabsdet
+   def _evaluate_student_t_candidates(self, residuals, candidates):
+      """Parallel evaluation of Student-t parameter candidates using vectorized operations"""
+      n_candidates = len(candidates)
+      n_residuals = len(residuals)
+      
+      # Extract parameters into tensors for vectorized operations
+      nus = torch.tensor([params['nu'] for params in candidates], device=residuals.device, dtype=residuals.dtype)
+      sigma_scales = torch.tensor([params['sigma_scale'] for params in candidates], device=residuals.device, dtype=residuals.dtype)
+      
+      # Compute median-based sigma estimate (shared across all candidates)
+      med = torch.median(residuals.abs()).item() + 1e-12
+      base_sigma = max(med / 0.6745, 1e-9)
+      
+      # Broadcast sigmas: shape [n_candidates]
+      sigmas = base_sigma * sigma_scales
+      
+      # Broadcast residuals for all candidates: shape [n_candidates, n_residuals] 
+      residuals_expanded = residuals.unsqueeze(0).expand(n_candidates, -1)
+      sigmas_expanded = sigmas.unsqueeze(1).expand(-1, n_residuals)  # shape [n_candidates, n_residuals]
+      nus_expanded = nus.unsqueeze(1).expand(-1, n_residuals)  # shape [n_candidates, n_residuals]
+      
+      # Vectorized Student-t log probability computation
+      # StudentT PDF: p(x) = Γ((ν+1)/2) / (√(νπ)·Γ(ν/2)·σ) · (1 + x²/(νσ²))^(-(ν+1)/2)
+      
+      # Standardized residuals: shape [n_candidates, n_residuals]
+      z = residuals_expanded / sigmas_expanded
+      
+      # Log probability computation (vectorized)
+      # log p(x) = log_gamma((ν+1)/2) - 0.5*log(νπ) - log_gamma(ν/2) - log(σ) - ((ν+1)/2)*log(1 + z²/ν)
+      log_gamma_half_nu_plus_1 = torch.lgamma((nus_expanded + 1) / 2)
+      log_gamma_half_nu = torch.lgamma(nus_expanded / 2)
+      log_sqrt_nu_pi = 0.5 * (torch.log(nus_expanded) + math.log(math.pi))
+      log_sigma = torch.log(sigmas_expanded)
+      log_one_plus_z_sq_over_nu = torch.log1p((z * z) / nus_expanded)
+      
+      # Shape: [n_candidates, n_residuals]
+      log_probs = (log_gamma_half_nu_plus_1 - log_sqrt_nu_pi - log_gamma_half_nu 
+                  - log_sigma - ((nus_expanded + 1) / 2) * log_one_plus_z_sq_over_nu)
+      
+      # Sum log probabilities across residuals for each candidate: shape [n_candidates]
+      nll_bits = -log_probs.sum(dim=1) / math.log(2.0)  # Convert to bits
+      
+      # Add parameter encoding bits (vectorized)
+      param_bits = 0.5 * math.log2(max(2, n_residuals)) + 0.5 * math.log2(max(2, n_residuals))
+      discretization_bits = n_residuals * math.log2(1000.0)  # 1e-6 resolution
+      
+      # Total bits for each candidate
+      scores = nll_bits + param_bits + discretization_bits
+      
+      return scores
+   def _evaluate_lambda_candidates(self, residuals, candidates, method):
+      """Parallel evaluation of lambda parameter candidates using vectorized operations"""
+      n_candidates = len(candidates)
+      n_residuals = len(residuals)
+      
+      # Extract lambdas into tensor
+      lambdas = torch.tensor([params['lambda'] for params in candidates], device=residuals.device, dtype=residuals.dtype)
+      
+      # Initialize scores tensor
+      scores = torch.full((n_candidates,), float('inf'), device=residuals.device, dtype=residuals.dtype)
+      
+      # Process each lambda (some operations are hard to vectorize due to conditional logic)
+      # But we can still batch the final computations
+      transformed_list = []
+      logabsdet_list = []
+      valid_mask = torch.ones(n_candidates, dtype=torch.bool, device=residuals.device)
+      
+      for i, lam in enumerate(lambdas.tolist()):
+         try:
+            if method == 'yeo-johnson':
+               t, logabsdet_nat = self._yj_transform_and_logabsdet_jac(residuals, lam)
+            else:  # box-cox
+               c = float(torch.clamp(-(residuals.min()) + 1e-6, min=1e-9).item())
+               t, logabsdet_nat = self._bc_transform_and_logabsdet_jac(residuals, lam, c)
+            
+            # Mean-center
+            t = t - t.mean()
+            transformed_list.append(t)
+            logabsdet_list.append(logabsdet_nat)
+            
+         except Exception:
+            valid_mask[i] = False
+            transformed_list.append(torch.zeros_like(residuals))  # placeholder
+            logabsdet_list.append(torch.tensor(0.0, device=residuals.device))
+      
+      if valid_mask.any():
+         # Stack all valid transformations: shape [n_candidates, n_residuals]
+         transformed_stack = torch.stack(transformed_list, dim=0)
+         logabsdet_stack = torch.stack(logabsdet_list, dim=0)
+         
+         # Vectorized variance computation (with safety clamp)
+         var_t = torch.var(transformed_stack, dim=1, unbiased=False).clamp_min(1e-12)
+         
+         # Vectorized bits computation
+         bits_gauss = 0.5 * n_residuals * math.log2(2.0 * math.pi * math.e) + 0.5 * n_residuals * torch.log2(var_t)
+         bits_jac = -(logabsdet_stack / math.log(2.0))
+         bits_param = 0.5 * math.log2(max(2, n_residuals))
+         bits_disc = n_residuals * math.log2(1000.0)  # 1e-6 resolution
+         
+         total_bits = bits_gauss + bits_jac + bits_param + bits_disc
+         
+         # Only update valid candidates
+         scores[valid_mask] = total_bits[valid_mask]
+      
+      return scores
