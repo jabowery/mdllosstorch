@@ -49,80 +49,6 @@ def _bc_transform_and_logabsdet_jac(r: torch.Tensor, lam: float, c: float):
     return t, logabsdet
 
 
-def residual_bits_transformed_gradsafe(
-    original: torch.Tensor,
-    reconstructed: torch.Tensor,
-    lam_grid: torch.Tensor = None,
-    method: str = "yeo-johnson",
-    offset_c: float = None,
-    include_param_bits: bool = True,
-    data_resolution: float = 1e-6,
-) -> torch.Tensor:
-    """MDL residual bits with Yeo-Johnson/Box-Cox, Jacobian, lambda bits, and discretization.
-    Select lambda off-graph (no_grad) to keep gradients stable."""
-
-    r_full = (original - reconstructed).flatten()
-    mask = torch.isfinite(r_full)
-    if not mask.any():
-        return torch.tensor(float("inf"), device=original.device, dtype=original.dtype)
-    r = r_full[mask]
-
-    if lam_grid is None:
-        lam_grid = torch.linspace(-2.0, 2.0, 81, device=r.device, dtype=r.dtype)
-
-    with torch.no_grad():
-        rd = r.detach()
-        best = None
-        for lam in lam_grid.tolist():
-            if method == "yeo-johnson":
-                t, logabsdet_nat = _yj_transform_and_logabsdet_jac(rd, float(lam))
-                c = None
-            elif method == "box-cox":
-                c = offset_c
-                if c is None:
-                    c = float(torch.clamp(-(rd.min()) + 1e-6, min=1e-9).item())
-                t, logabsdet_nat = _bc_transform_and_logabsdet_jac(rd, float(lam), c)
-            else:
-                raise ValueError("method must be 'yeo-johnson' or 'box-cox'")
-
-            t = t - t.mean()
-            var_t = _safe_var(t)
-            n = t.numel()
-            bits_gauss = 0.5 * n * _log2(
-                torch.tensor(2.0 * math.pi * math.e, device=rd.device, dtype=rd.dtype)
-            ) + 0.5 * n * _log2(var_t)
-            bits_jac = -(logabsdet_nat / _LOG2)
-            bits_param = (0.5 * math.log2(max(2, n))) if include_param_bits else 0.0
-            if method == "box-cox" and offset_c is None:
-                bits_param += 0.5 * math.log2(max(2, n))
-            bits_disc = n * math.log2(1.0 / data_resolution)
-            total = bits_gauss + bits_jac + bits_param + bits_disc
-            if (best is None) or (total < best[0]):
-                best = (total, float(lam), c)
-        lam_star, c_star = best[1], best[2]
-
-    if method == "yeo-johnson":
-        t, logabsdet_nat = _yj_transform_and_logabsdet_jac(r, lam_star)
-    else:
-        if c_star is None:
-            c_star = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
-        t, logabsdet_nat = _bc_transform_and_logabsdet_jac(r, lam_star, c_star)
-
-    t = t - t.mean()
-    var_t = _safe_var(t)
-    n = t.numel()
-    bits_gauss = 0.5 * n * _log2(
-        torch.tensor(2.0 * math.pi * math.e, device=r.device, dtype=r.dtype)
-    ) + 0.5 * n * _log2(var_t)
-    bits_jac = -(logabsdet_nat / _LOG2)
-    bits_param = (0.5 * math.log2(max(2, n))) if include_param_bits else 0.0
-    if method == "box-cox" and offset_c is None and method == "box-cox":
-        bits_param += 0.5 * math.log2(max(2, n))
-    bits_disc = n * math.log2(1.0 / data_resolution)
-
-    return bits_gauss + bits_jac + bits_param + bits_disc
-
-
 def residual_bits_transformed_softmin(
     original: torch.Tensor,
     reconstructed: torch.Tensor,
@@ -209,3 +135,94 @@ def gauss_nml_bits(
 
     total_bits = diff_bits + q_const + penalty_sigma
     return total_bits
+def residual_bits_transformed_gradsafe(
+   original: torch.Tensor,
+   reconstructed: torch.Tensor,
+   lam_grid: torch.Tensor = None,
+   method: str = "yeo-johnson",
+   offset_c: float = None,
+   include_param_bits: bool = True,
+   data_resolution: float = 1e-6,
+   use_parallel_sa: bool = False,
+) -> torch.Tensor:
+    """MDL residual bits with Yeo-Johnson/Box-Cox, Jacobian, lambda bits, and discretization.
+   
+   Args:
+       use_parallel_sa: If True, use parallel simulated annealing instead of grid search
+   """
+    r_full = (original - reconstructed).flatten()
+    mask = torch.isfinite(r_full)
+    if not mask.any():
+        return torch.tensor(float("inf"), device=original.device, dtype=original.dtype)
+    r = r_full[mask]
+
+    if use_parallel_sa:
+        # Use parallel simulated annealing search
+        from .parallel_sa import MDLParallelHyperparameterSearch
+        
+        if not hasattr(residual_bits_transformed_gradsafe, '_sa_search'):
+            residual_bits_transformed_gradsafe._sa_search = MDLParallelHyperparameterSearch()
+        
+        with torch.no_grad():
+            rd = r.detach()
+            lam_star = residual_bits_transformed_gradsafe._sa_search.search_lambda_params(rd, method)
+            if method == "box-cox" and offset_c is None:
+                c_star = float(torch.clamp(-(rd.min()) + 1e-6, min=1e-9).item())
+            else:
+                c_star = offset_c
+    else:
+        # Original grid search implementation
+        if lam_grid is None:
+            lam_grid = torch.linspace(-2.0, 2.0, 81, device=r.device, dtype=r.dtype)
+
+        with torch.no_grad():
+            rd = r.detach()
+            best = None
+            for lam in lam_grid.tolist():
+                if method == "yeo-johnson":
+                    t, logabsdet_nat = _yj_transform_and_logabsdet_jac(rd, float(lam))
+                    c = None
+                elif method == "box-cox":
+                    c = offset_c
+                    if c is None:
+                        c = float(torch.clamp(-(rd.min()) + 1e-6, min=1e-9).item())
+                    t, logabsdet_nat = _bc_transform_and_logabsdet_jac(rd, float(lam), c)
+                else:
+                    raise ValueError("method must be 'yeo-johnson' or 'box-cox'")
+
+                t = t - t.mean()
+                var_t = _safe_var(t)
+                n = t.numel()
+                bits_gauss = 0.5 * n * _log2(
+                    torch.tensor(2.0 * math.pi * math.e, device=rd.device, dtype=rd.dtype)
+                ) + 0.5 * n * _log2(var_t)
+                bits_jac = -(logabsdet_nat / _LOG2)
+                bits_param = (0.5 * math.log2(max(2, n))) if include_param_bits else 0.0
+                if method == "box-cox" and offset_c is None:
+                    bits_param += 0.5 * math.log2(max(2, n))
+                bits_disc = n * math.log2(1.0 / data_resolution)
+                total = bits_gauss + bits_jac + bits_param + bits_disc
+                if (best is None) or (total < best[0]):
+                    best = (total, float(lam), c)
+            lam_star, c_star = best[1], best[2]
+
+    if method == "yeo-johnson":
+        t, logabsdet_nat = _yj_transform_and_logabsdet_jac(r, lam_star)
+    else:
+        if c_star is None:
+            c_star = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
+        t, logabsdet_nat = _bc_transform_and_logabsdet_jac(r, lam_star, c_star)
+
+    t = t - t.mean()
+    var_t = _safe_var(t)
+    n = t.numel()
+    bits_gauss = 0.5 * n * _log2(
+        torch.tensor(2.0 * math.pi * math.e, device=r.device, dtype=r.dtype)
+    ) + 0.5 * n * _log2(var_t)
+    bits_jac = -(logabsdet_nat / _LOG2)
+    bits_param = (0.5 * math.log2(max(2, n))) if include_param_bits else 0.0
+    if method == "box-cox" and offset_c is None and method == "box-cox":
+        bits_param += 0.5 * math.log2(max(2, n))
+    bits_disc = n * math.log2(1.0 / data_resolution)
+
+    return bits_gauss + bits_jac + bits_param + bits_disc
