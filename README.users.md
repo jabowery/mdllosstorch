@@ -41,4 +41,6 @@ print("total bits:", bits.item())
 print(report_mdl(x, yhat, model, data_resolution="auto"))
 ```
 
-[API Documentation](mdllosstorch_API.pdf)
+[API Documentation (PDF)](mdllosstorch_API.pdf)
+
+[API Documentation (markdown)](mdllosstorch_api.md)
