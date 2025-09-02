@@ -1,25 +1,32 @@
 import math
+
 import torch
 from torch.distributions import StudentT
 
 _LOG2E = 1.0 / math.log(2.0)
+
+
 def parameter_bits_model_student_t(
-   model: torch.nn.Module,
-   include_param_bits: bool = True,
-   param_resolution: float = 1e-6,
-   use_parallel_sa: bool = False,
+    model: torch.nn.Module,
+    include_param_bits: bool = True,
+    param_resolution: float = 1e-6,
+    use_parallel_sa: bool = False,
 ) -> torch.Tensor:
     """Sum of Student-t parameter bits over all model parameters that require grad."""
     device = next((p.device for p in model.parameters()), torch.device("cpu"))
     total = torch.tensor(0.0, device=device)
-    for name, p in model.named_parameters():
+    for _, p in model.named_parameters():
         if not p.requires_grad:
             continue
         total = total + parameter_bits_student_t_gradsafe(
-            p, include_param_bits=include_param_bits, param_resolution=param_resolution,
-            use_parallel_sa=use_parallel_sa
+            p,
+            include_param_bits=include_param_bits,
+            param_resolution=param_resolution,
+            use_parallel_sa=use_parallel_sa,
         )
     return total
+
+
 def parameter_bits_student_t_gradsafe(
     w: torch.Tensor,
     include_param_bits: bool = True,
@@ -29,7 +36,7 @@ def parameter_bits_student_t_gradsafe(
     use_parallel_sa: bool = False,
 ) -> torch.Tensor:
     """MDL bits for a parameter tensor under a Student-t(nu, sigma) prior.
-    
+
     Args:
         use_parallel_sa: If True, use parallel simulated annealing instead of grid search
     """
@@ -42,29 +49,32 @@ def parameter_bits_student_t_gradsafe(
     if use_parallel_sa:
         # Use parallel simulated annealing search
         from .parallel_sa import MDLParallelHyperparameterSearch
-        
-        if not hasattr(parameter_bits_student_t_gradsafe, '_sa_search'):
+
+        if not hasattr(parameter_bits_student_t_gradsafe, "_sa_search"):
             parameter_bits_student_t_gradsafe._sa_search = MDLParallelHyperparameterSearch()
-        
+
         with torch.no_grad():
             xd = x.detach()
-            nu_star, sigma_scale = parameter_bits_student_t_gradsafe._sa_search.search_student_t_params(xd, param_resolution)
+            nu_star, sigma_scale = (
+                parameter_bits_student_t_gradsafe._sa_search.search_student_t_params(
+                    xd, param_resolution
+                )
+            )
             med = torch.median(xd.abs()).item() + 1e-12
-            sigma_star = max(med / 0.6745, 1e-9) * sigma_scale
+            base = max(med / 0.6745, param_resolution)
+            sigma_star = max(base * sigma_scale, param_resolution)
     else:
         # Original grid search implementation
         with torch.no_grad():
             xd = x.detach()
             med = torch.median(xd.abs()).item() + 1e-12
-            base = max(med / 0.6745, 1e-9)
+            base = max(med / 0.6745, param_resolution)
             sigmas = [base * s for s in sigma_scales]
             best = None
             for nu in nu_grid:
                 dist = StudentT(df=float(nu), loc=0.0, scale=1.0)
                 for sigma in sigmas:
-                    nll_nat = -dist.log_prob(xd / sigma).sum() + xd.numel() * math.log(
-                        sigma
-                    )
+                    nll_nat = -dist.log_prob(xd / sigma).sum() + xd.numel() * math.log(sigma)
                     bits = nll_nat * _LOG2E
                     if include_param_bits:
                         bits += 0.5 * math.log2(max(2, n)) + 0.5 * math.log2(max(2, n))
@@ -74,6 +84,7 @@ def parameter_bits_student_t_gradsafe(
             nu_star, sigma_star = best[1], best[2]
 
     dist = StudentT(df=nu_star, loc=0.0, scale=1.0)
+    sigma_star = max(float(sigma_star), param_resolution)
     nll_nat = -dist.log_prob(x / sigma_star).sum() + x.numel() * math.log(sigma_star)
     bits = nll_nat * _LOG2E
     if include_param_bits:
