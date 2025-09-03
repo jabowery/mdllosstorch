@@ -325,7 +325,7 @@ def residual_bits_per_feature(
     use_parallel_sa: bool = False,
 ) -> torch.Tensor:
     """MDL bits with per-feature transforms - each feature gets its own lambda."""
-    from .debug_logging import log_tensor_moments, logger
+    from .debug_logging import log_tensor_moments, log_transform_comparison, logger
     
     if residuals.ndim == 1:
         residuals = residuals.view(-1, 1)
@@ -338,6 +338,9 @@ def residual_bits_per_feature(
         logger.debug(f"  Processing {n_features} features with {n_samples} samples each")
         log_tensor_moments(residuals, "All residuals")
     
+    # Track statistics for reporting
+    transform_improvements = []
+    
     for feat_idx in range(n_features):
         r = residuals[:, feat_idx]
         r = r[torch.isfinite(r)]
@@ -345,17 +348,35 @@ def residual_bits_per_feature(
         if r.numel() == 0:
             continue
             
+        # Log original feature statistics
+        r_original_var = torch.var(r, unbiased=False).item()
+        r_original_skew = None
+        r_original_kurt = None
+        
+        if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+            # Calculate skewness and kurtosis for detailed features
+            with torch.no_grad():
+                r_mean = r.mean()
+                r_std = r.std(unbiased=False)
+                if r_std > 1e-12:
+                    r_centered = r - r_mean
+                    r_original_skew = (r_centered ** 3).mean().item() / (r_std ** 3).item()
+                    r_original_kurt = (r_centered ** 4).mean().item() / (r_std ** 4).item() - 3.0
+            
+            logger.debug(f"  === Feature {feat_idx} Transform Analysis ===")
+            log_tensor_moments(r, f"Feature {feat_idx} before transform")
+            
         # Find optimal transform for this feature
         if use_parallel_sa:
             from .parallel_sa import MDLParallelHyperparameterSearch
-            sa_search = MDLParallelHyperparameterSearch(memory_limit_mb=500)  # Smaller for single features
+            sa_search = MDLParallelHyperparameterSearch(memory_limit_mb=500)
             try:
                 lam_star = sa_search.search_lambda_params(r, method, data_resolution)
             except:
-                lam_star = 0.0  # Fallback to identity
+                lam_star = 0.0
         else:
-            # Simple grid search for this feature
-            lam_grid = torch.linspace(-2.0, 2.0, 21, device=r.device, dtype=r.dtype)  # Coarser grid
+            # Grid search for this feature
+            lam_grid = torch.linspace(-2.0, 2.0, 21, device=r.device, dtype=r.dtype)
             best_var = float('inf')
             lam_star = 0.0
             
@@ -386,7 +407,6 @@ def residual_bits_per_feature(
                 c = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
                 t, logabsdet_nat = _bc_transform_and_logabsdet_jac(r, lam_star, c)
             else:
-                # Identity transform
                 t = r
                 logabsdet_nat = 0.0
                 
@@ -394,28 +414,81 @@ def residual_bits_per_feature(
             var_t = _safe_var(t)
             n = t.numel()
             
-            # Bits for this feature
+            # Track improvement metrics
+            var_improvement = r_original_var - var_t.item()
+            var_reduction_pct = (var_improvement / r_original_var) * 100 if r_original_var > 0 else 0
+            transform_improvements.append({
+                'feature': feat_idx,
+                'lambda': lam_star,
+                'var_before': r_original_var,
+                'var_after': var_t.item(),
+                'var_reduction_pct': var_reduction_pct
+            })
+            
+            # Detailed logging for selected features
+            if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                log_tensor_moments(t, f"Feature {feat_idx} after transform")
+                logger.debug(f"    Lambda: {lam_star:.4f}")
+                logger.debug(f"    Variance: {r_original_var:.6f} → {var_t.item():.6f} ({var_reduction_pct:+.1f}%)")
+                if r_original_skew is not None:
+                    # Calculate post-transform skewness/kurtosis
+                    t_std = t.std(unbiased=False)
+                    if t_std > 1e-12:
+                        t_skew = (t ** 3).mean().item() / (t_std ** 3).item()
+                        t_kurt = (t ** 4).mean().item() / (t_std ** 4).item() - 3.0
+                        logger.debug(f"    Skewness: {r_original_skew:.3f} → {t_skew:.3f}")
+                        logger.debug(f"    Kurtosis: {r_original_kurt:.3f} → {t_kurt:.3f}")
+                
+                # Show extreme values to check for numerical issues
+                logger.debug(f"    Range: [{t.min().item():.3f}, {t.max().item():.3f}]")
+                if t.max().item() > 100 or t.min().item() < -100:
+                    logger.debug(f"    WARNING: Extreme values detected in transformed feature {feat_idx}")
+            
+            # Bits calculation
             bits_gauss = 0.5 * n * _log2(torch.tensor(2.0 * math.pi * math.e, device=r.device)) + 0.5 * n * _log2(var_t)
             bits_jac = -(logabsdet_nat / _LOG2)
-            bits_param = 0.5 * math.log2(max(2, n))  # Cost to encode lambda for this feature
+            bits_param = 0.5 * math.log2(max(2, n))
             bits_disc = n * math.log2(1.0 / data_resolution)
             
             feature_bits = bits_gauss + bits_jac + bits_param + bits_disc
             total_bits = total_bits + feature_bits
             
+            # Regular progress logging
             if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 10) == 0:
-                logger.debug(f"    Feature {feat_idx}: lambda={lam_star:.3f}, bits={feature_bits:.1f}")
+                logger.debug(f"    Feature {feat_idx}: lambda={lam_star:.3f}, var_reduction={var_reduction_pct:+.1f}%, bits={feature_bits:.1f}")
                 
         except Exception as e:
             # Fallback to identity for problematic features
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"    Feature {feat_idx}: Transform failed ({e}), using identity")
             n = r.numel()
             var_r = _safe_var(r)
             bits_gauss = 0.5 * n * _log2(torch.tensor(2.0 * math.pi * math.e, device=r.device)) + 0.5 * n * _log2(var_r)
             bits_disc = n * math.log2(1.0 / data_resolution)
             feature_bits = bits_gauss + bits_disc
             total_bits = total_bits + feature_bits
+            
+            transform_improvements.append({
+                'feature': feat_idx,
+                'lambda': 0.0,
+                'var_before': r_original_var,
+                'var_after': r_original_var,
+                'var_reduction_pct': 0.0
+            })
     
-    if logger.isEnabledFor(logging.DEBUG):
+    # Summary statistics
+    if logger.isEnabledFor(logging.DEBUG) and transform_improvements:
+        successful_transforms = [t for t in transform_improvements if abs(t['lambda']) > 1e-6]
+        var_reductions = [t['var_reduction_pct'] for t in transform_improvements]
+        
+        logger.debug(f"  === Transform Summary ===")
+        logger.debug(f"    Features processed: {len(transform_improvements)}")
+        logger.debug(f"    Non-identity transforms: {len(successful_transforms)} ({100*len(successful_transforms)/len(transform_improvements):.1f}%)")
+        if var_reductions:
+            import statistics
+            logger.debug(f"    Variance reduction: mean={statistics.mean(var_reductions):.1f}%, median={statistics.median(var_reductions):.1f}%")
+            logger.debug(f"    Best improvement: {max(var_reductions):.1f}%, worst: {min(var_reductions):.1f}%")
+        
         logger.debug(f"  Total per-feature bits: {total_bits.item():.1f}")
         
     return total_bits
