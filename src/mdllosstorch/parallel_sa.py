@@ -18,47 +18,6 @@ class ParallelAdaptiveAnnealingSampler:
 
     def _default_param_bounds(self):
         return {"nu": (1.5, 64.0), "sigma_scale": (0.25, 4.0), "lambda": (-2.0, 2.0)}
-
-    def _random_sample(self):
-        """Sample random parameters within bounds"""
-        nu = (
-            torch.rand(1) * (self.param_bounds["nu"][1] - self.param_bounds["nu"][0])
-            + self.param_bounds["nu"][0]
-        )
-        sigma_scale = (
-            torch.rand(1)
-            * (self.param_bounds["sigma_scale"][1] - self.param_bounds["sigma_scale"][0])
-            + self.param_bounds["sigma_scale"][0]
-        )
-        lambda_val = (
-            torch.rand(1) * (self.param_bounds["lambda"][1] - self.param_bounds["lambda"][0])
-            + self.param_bounds["lambda"][0]
-        )
-        return {"nu": float(nu), "sigma_scale": float(sigma_scale), "lambda": float(lambda_val)}
-
-    def _perturb_around_best(self, best_params, temperature):
-        """Smart perturbation based on temperature"""
-        nu_std = temperature * 2.0
-        sigma_std = temperature * 0.2
-        lambda_std = temperature * 0.3
-
-        nu = torch.clamp(
-            torch.tensor(best_params["nu"]) + torch.randn(1) * nu_std,
-            self.param_bounds["nu"][0],
-            self.param_bounds["nu"][1],
-        )
-        sigma_scale = torch.clamp(
-            torch.tensor(best_params["sigma_scale"]) * torch.exp(torch.randn(1) * sigma_std),
-            self.param_bounds["sigma_scale"][0],
-            self.param_bounds["sigma_scale"][1],
-        )
-        lambda_val = torch.clamp(
-            torch.tensor(best_params["lambda"]) + torch.randn(1) * lambda_std,
-            self.param_bounds["lambda"][0],
-            self.param_bounds["lambda"][1],
-        )
-
-        return {"nu": float(nu), "sigma_scale": float(sigma_scale), "lambda": float(lambda_val)}
     def sample_candidates(self, current_params=None):
         """Generate n_parallel candidate parameter sets using adaptive sampling"""
         candidates = []
@@ -161,6 +120,65 @@ class ParallelAdaptiveAnnealingSampler:
             self.current_best = fallback
             self.current_best_score = float('inf')
             return fallback, False
+    def _random_sample(self):
+        """Sample random parameters within bounds"""
+        result = {}
+        
+        if "nu" in self.param_bounds:
+            nu = (
+                torch.rand(1) * (self.param_bounds["nu"][1] - self.param_bounds["nu"][0])
+                + self.param_bounds["nu"][0]
+            )
+            result["nu"] = float(nu)
+            
+        if "sigma_scale" in self.param_bounds:
+            sigma_scale = (
+                torch.rand(1)
+                * (self.param_bounds["sigma_scale"][1] - self.param_bounds["sigma_scale"][0])
+                + self.param_bounds["sigma_scale"][0]
+            )
+            result["sigma_scale"] = float(sigma_scale)
+            
+        if "lambda" in self.param_bounds:
+            lambda_val = (
+                torch.rand(1) * (self.param_bounds["lambda"][1] - self.param_bounds["lambda"][0])
+                + self.param_bounds["lambda"][0]
+            )
+            result["lambda"] = float(lambda_val)
+            
+        return result
+    def _perturb_around_best(self, best_params, temperature):
+        """Smart perturbation based on temperature"""
+        result = {}
+        
+        if "nu" in best_params and "nu" in self.param_bounds:
+            nu_std = temperature * 2.0
+            nu = torch.clamp(
+                torch.tensor(best_params["nu"]) + torch.randn(1) * nu_std,
+                self.param_bounds["nu"][0],
+                self.param_bounds["nu"][1],
+            )
+            result["nu"] = float(nu)
+            
+        if "sigma_scale" in best_params and "sigma_scale" in self.param_bounds:
+            sigma_std = temperature * 0.2
+            sigma_scale = torch.clamp(
+                torch.tensor(best_params["sigma_scale"]) * torch.exp(torch.randn(1) * sigma_std),
+                self.param_bounds["sigma_scale"][0],
+                self.param_bounds["sigma_scale"][1],
+            )
+            result["sigma_scale"] = float(sigma_scale)
+            
+        if "lambda" in best_params and "lambda" in self.param_bounds:
+            lambda_std = temperature * 0.3
+            lambda_val = torch.clamp(
+                torch.tensor(best_params["lambda"]) + torch.randn(1) * lambda_std,
+                self.param_bounds["lambda"][0],
+                self.param_bounds["lambda"][1],
+            )
+            result["lambda"] = float(lambda_val)
+
+        return result
 
 
 class MDLParallelHyperparameterSearch:
