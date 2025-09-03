@@ -366,80 +366,6 @@ class MDLParallelHyperparameterSearch:
 
         return total_bits
 
-    def _vectorized_yj_transform(self, residuals_expanded, lambdas_expanded):
-        """Vectorized Yeo-Johnson transformation for all candidates simultaneously"""
-        # residuals_expanded: [n_candidates, n_residuals]
-        # lambdas_expanded: [n_candidates, n_residuals]
-
-        # Split into positive and negative masks
-        positive_mask = residuals_expanded >= 0
-        negative_mask = ~positive_mask
-
-        # Initialize output tensors
-        transformed = torch.zeros_like(residuals_expanded)
-        logabsdet_total = torch.zeros(
-            residuals_expanded.shape[0],
-            device=residuals_expanded.device,
-            dtype=residuals_expanded.dtype,
-        )
-
-        # Handle positive values: T(r) = ((r+1)^λ - 1) / λ if λ≠0, else log(r+1)
-        if positive_mask.any():
-            r_pos = residuals_expanded[positive_mask]
-            lam_pos = lambdas_expanded[positive_mask]
-
-            # Separate λ=0 and λ≠0 cases
-            lam_zero_mask = torch.abs(lam_pos) < 1e-10
-            lam_nonzero_mask = ~lam_zero_mask
-
-            if lam_zero_mask.any():
-                transformed[positive_mask][lam_zero_mask] = torch.log1p(r_pos[lam_zero_mask])
-
-            if lam_nonzero_mask.any():
-                r_nz = r_pos[lam_nonzero_mask]
-                lam_nz = lam_pos[lam_nonzero_mask]
-                transformed[positive_mask][lam_nonzero_mask] = (
-                    (r_nz + 1.0) ** lam_nz - 1.0
-                ) / lam_nz
-
-            # Jacobian for positive values: (λ-1) * log(r+1)
-            logabsdet_pos = (lambdas_expanded[positive_mask] - 1.0) * torch.log1p(r_pos)
-            # Sum across residuals for each candidate
-            for i in range(residuals_expanded.shape[0]):
-                mask_i = positive_mask[i]
-                if mask_i.any():
-                    logabsdet_total[i] += logabsdet_pos[positive_mask[i]].sum()
-
-        # Handle negative values: T(r) = -(((1-r)^(2-λ) - 1) / (2-λ)) if 2-λ≠0, else -log(1-r)
-        if negative_mask.any():
-            r_neg = residuals_expanded[negative_mask]
-            lam_neg = lambdas_expanded[negative_mask]
-            lam2 = 2.0 - lam_neg
-
-            # Separate (2-λ)=0 and (2-λ)≠0 cases
-            lam2_zero_mask = torch.abs(lam2) < 1e-10
-            lam2_nonzero_mask = ~lam2_zero_mask
-
-            if lam2_zero_mask.any():
-                transformed[negative_mask][lam2_zero_mask] = -torch.log1p(-r_neg[lam2_zero_mask])
-
-            if lam2_nonzero_mask.any():
-                r_nz = r_neg[lam2_nonzero_mask]
-                lam2_nz = lam2[lam2_nonzero_mask]
-                transformed[negative_mask][lam2_nonzero_mask] = -(
-                    ((1.0 - r_nz) ** lam2_nz - 1.0) / lam2_nz
-                )
-
-            # Jacobian for negative values: (1-λ) * log(1-r)
-            logabsdet_neg = (1.0 - lambdas_expanded[negative_mask]) * torch.log1p(-r_neg)
-            # Sum across residuals for each candidate
-            for i in range(residuals_expanded.shape[0]):
-                mask_i = negative_mask[i]
-                if mask_i.any():
-                    logabsdet_total[i] += logabsdet_neg[negative_mask[i]].sum()
-
-        return transformed, logabsdet_total
-
     def _vectorized_bc_transform(self, residuals_expanded, lambdas_expanded):
         """Vectorized Box-Cox transformation for all candidates simultaneously"""
         # residuals_expanded: [n_candidates, n_residuals]
@@ -567,3 +493,110 @@ class MDLParallelHyperparameterSearch:
         best_params, accepted = self.lambda_sampler.update_and_accept(candidates, scores)
 
         return best_params["lambda"]
+    def _vectorized_yj_transform(self, residuals_expanded, lambdas_expanded):
+        """Vectorized Yeo-Johnson transformation for all candidates simultaneously"""
+        # residuals_expanded: [n_candidates, n_residuals]
+        # lambdas_expanded: [n_candidates, n_residuals]
+
+        # Split into positive and negative masks
+        positive_mask = residuals_expanded >= 0
+        negative_mask = ~positive_mask
+
+        # Initialize output tensors
+        transformed = torch.zeros_like(residuals_expanded)
+        logabsdet_total = torch.zeros(
+            residuals_expanded.shape[0],
+            device=residuals_expanded.device,
+            dtype=residuals_expanded.dtype,
+        )
+
+        # Handle positive values: T(r) = ((r+1)^λ - 1) / λ if λ≠0, else log(r+1)
+        if positive_mask.any():
+            r_pos = residuals_expanded[positive_mask]
+            lam_pos = lambdas_expanded[positive_mask]
+
+            # Separate λ=0 and λ≠0 cases
+            lam_zero_mask = torch.abs(lam_pos) < 1e-10
+            lam_nonzero_mask = ~lam_zero_mask
+
+            # Create temporary tensor for positive transforms
+            t_pos = torch.zeros_like(r_pos)
+            
+            if lam_zero_mask.any():
+                t_pos[lam_zero_mask] = torch.log1p(r_pos[lam_zero_mask])
+
+            if lam_nonzero_mask.any():
+                r_nz = r_pos[lam_nonzero_mask]
+                lam_nz = lam_pos[lam_nonzero_mask]
+                t_pos[lam_nonzero_mask] = ((r_nz + 1.0) ** lam_nz - 1.0) / lam_nz
+
+            # Assign back to main tensor
+            transformed[positive_mask] = t_pos
+
+            # Jacobian for positive values: (λ-1) * log(r+1)
+            logabsdet_pos = (lam_pos - 1.0) * torch.log1p(r_pos)
+            
+            # Sum across residuals for each candidate
+            for i in range(residuals_expanded.shape[0]):
+                candidate_pos_mask = positive_mask[i]
+                if candidate_pos_mask.any():
+                    # Find indices in the flattened positive array that correspond to candidate i
+                    candidate_start = i * residuals_expanded.shape[1]
+                    candidate_end = (i + 1) * residuals_expanded.shape[1]
+                    pos_indices_for_candidate = torch.arange(
+                        candidate_start, candidate_end, device=residuals_expanded.device
+                    )[candidate_pos_mask]
+                    
+                    # Map back to position in logabsdet_pos array
+                    global_pos_indices = torch.nonzero(positive_mask.view(-1), as_tuple=True)[0]
+                    local_indices = torch.searchsorted(global_pos_indices, pos_indices_for_candidate)
+                    
+                    if len(local_indices) > 0:
+                        logabsdet_total[i] += logabsdet_pos[local_indices].sum()
+
+        # Handle negative values: T(r) = -(((1-r)^(2-λ) - 1) / (2-λ)) if 2-λ≠0, else -log(1-r)
+        if negative_mask.any():
+            r_neg = residuals_expanded[negative_mask]
+            lam_neg = lambdas_expanded[negative_mask]
+            lam2 = 2.0 - lam_neg
+
+            # Separate (2-λ)=0 and (2-λ)≠0 cases
+            lam2_zero_mask = torch.abs(lam2) < 1e-10
+            lam2_nonzero_mask = ~lam2_zero_mask
+
+            # Create temporary tensor for negative transforms
+            t_neg = torch.zeros_like(r_neg)
+            
+            if lam2_zero_mask.any():
+                t_neg[lam2_zero_mask] = -torch.log1p(-r_neg[lam2_zero_mask])
+
+            if lam2_nonzero_mask.any():
+                r_nz = r_neg[lam2_nonzero_mask]
+                lam2_nz = lam2[lam2_nonzero_mask]
+                t_neg[lam2_nonzero_mask] = -(((1.0 - r_nz) ** lam2_nz - 1.0) / lam2_nz)
+
+            # Assign back to main tensor
+            transformed[negative_mask] = t_neg
+
+            # Jacobian for negative values: (1-λ) * log(1-r)
+            logabsdet_neg = (1.0 - lam_neg) * torch.log1p(-r_neg)
+            
+            # Sum across residuals for each candidate
+            for i in range(residuals_expanded.shape[0]):
+                candidate_neg_mask = negative_mask[i]
+                if candidate_neg_mask.any():
+                    # Find indices in the flattened negative array that correspond to candidate i
+                    candidate_start = i * residuals_expanded.shape[1]
+                    candidate_end = (i + 1) * residuals_expanded.shape[1]
+                    neg_indices_for_candidate = torch.arange(
+                        candidate_start, candidate_end, device=residuals_expanded.device
+                    )[candidate_neg_mask]
+                    
+                    # Map back to position in logabsdet_neg array
+                    global_neg_indices = torch.nonzero(negative_mask.view(-1), as_tuple=True)[0]
+                    local_indices = torch.searchsorted(global_neg_indices, neg_indices_for_candidate)
+                    
+                    if len(local_indices) > 0:
+                        logabsdet_total[i] += logabsdet_neg[local_indices].sum()
+
+        return transformed, logabsdet_total
