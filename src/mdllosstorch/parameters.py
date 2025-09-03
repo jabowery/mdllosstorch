@@ -26,19 +26,23 @@ def parameter_bits_model_student_t(
         )
     return total
 def parameter_bits_student_t_gradsafe(
-   w: torch.Tensor,
-   include_param_bits: bool = True,
-   param_resolution: float = 1e-6,
-   nu_grid=(1.5, 2, 3, 5, 8, 16, 32, 64),
-   sigma_scales=(0.25, 0.5, 1.0, 2.0, 4.0),
-   use_parallel_sa: bool = False,
+    w: torch.Tensor,
+    include_param_bits: bool = True,
+    param_resolution: float = 1e-6,
+    nu_grid=(1.5, 2, 3, 5, 8, 16, 32, 64),
+    sigma_scales=(0.25, 0.5, 1.0, 2.0, 4.0),
+    use_parallel_sa: bool = False,
 ) -> torch.Tensor:
     """MDL bits for a parameter tensor under a Student-t(nu, sigma) prior.
 
-   Args:
-       use_parallel_sa: If True, use parallel simulated annealing instead of grid search
-   """
+    Args:
+        use_parallel_sa: If True, use parallel simulated annealing instead of grid search
+    """
     from .debug_logging import log_tensor_moments, logger
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"=== Parameter Bits Analysis ===")
+        log_tensor_moments(w, f"Original parameters (shape {list(w.shape)})")
     
     x = w.flatten()
     x = x[torch.isfinite(x)]
@@ -47,8 +51,8 @@ def parameter_bits_student_t_gradsafe(
         return torch.tensor(0.0, device=w.device, dtype=w.dtype)
 
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"=== Parameter Bits Analysis ===")
-        log_tensor_moments(w, "Original parameters")
+        if n != w.numel():
+            logger.debug(f"  Filtered to {n} finite parameters (removed {w.numel() - n} non-finite)")
         log_tensor_moments(x, "Filtered parameters (finite only)")
 
     if use_parallel_sa:
@@ -101,4 +105,14 @@ def parameter_bits_student_t_gradsafe(
     if include_param_bits:
         bits = bits + 0.5 * math.log2(max(2, n)) + 0.5 * math.log2(max(2, n))
     bits = bits + n * math.log2(1.0 / param_resolution)
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        param_penalty = (0.5 * math.log2(max(2, n)) + 0.5 * math.log2(max(2, n))) if include_param_bits else 0.0
+        discretization_bits = n * math.log2(1.0 / param_resolution)
+        nll_bits = nll_nat * _LOG2E
+        logger.debug(f"  NLL bits: {nll_bits:.2f}")
+        logger.debug(f"  Parameter penalty: {param_penalty:.2f}")
+        logger.debug(f"  Discretization bits: {discretization_bits:.2f}")
+        logger.debug(f"  Total bits: {bits.item():.2f}")
+    
     return bits

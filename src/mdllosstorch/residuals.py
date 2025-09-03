@@ -211,17 +211,21 @@ def residual_bits_transformed_gradsafe(
 
     return bits_gauss + bits_jac + bits_param + bits_disc
 def gauss_nml_bits(
-   residuals: torch.Tensor,
-   *,
-   data_resolution: float,
-   per_feature: bool = True,
-   include_quantization: bool = True,
-   ) -> torch.Tensor:
+    residuals: torch.Tensor,
+    *,
+    data_resolution: float,
+    per_feature: bool = True,
+    include_quantization: bool = True,
+    ) -> torch.Tensor:
     """
-   Absolute code length (in bits) for residuals using a Gaussian-with-unknown-variance
-   NML-style approximation, with a quantization-aware variance floor.
-   """
+    Absolute code length (in bits) for residuals using a Gaussian-with-unknown-variance
+    NML-style approximation, with a quantization-aware variance floor.
+    """
     from .debug_logging import log_tensor_moments, logger
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"=== Gaussian NML Analysis ===")
+        log_tensor_moments(residuals, "Input residuals (original shape)")
     
     x = residuals
     if x.ndim == 1:
@@ -232,9 +236,11 @@ def gauss_nml_bits(
     d = max(int(d), 1)
 
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"=== Gaussian NML Analysis ===")
-        log_tensor_moments(residuals, "Input residuals")
-        logger.debug(f"  Reshaped to: {n} samples x {d} features")
+        if d > 1:
+            logger.debug(f"  Reshaped to: {n} samples x {d} features")
+            log_tensor_moments(x, "Reshaped residuals")
+        else:
+            logger.debug(f"  Processing as: {n} samples x {d} feature (no reshape needed)")
 
     delta = float(max(data_resolution, _eps()))
     sigma2_floor = (delta ** 2) / 12.0
@@ -265,6 +271,7 @@ def gauss_nml_bits(
         logger.debug(f"  Differential bits: {diff_bits.item():.2f}")
         logger.debug(f"  Quantization bits: {q_const:.2f}")
         logger.debug(f"  Parameter penalty: {penalty_sigma:.2f}")
+        logger.debug(f"  Total bits: {(diff_bits + q_const + penalty_sigma).item():.2f}")
 
     total_bits = diff_bits + q_const + penalty_sigma
     return total_bits
