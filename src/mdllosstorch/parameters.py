@@ -1,6 +1,6 @@
 import math
-
 import torch
+import logging
 from torch.distributions import StudentT
 
 _LOG2E = 1.0 / math.log(2.0)
@@ -25,26 +25,31 @@ def parameter_bits_model_student_t(
             use_parallel_sa=use_parallel_sa,
         )
     return total
-
-
 def parameter_bits_student_t_gradsafe(
-    w: torch.Tensor,
-    include_param_bits: bool = True,
-    param_resolution: float = 1e-6,
-    nu_grid=(1.5, 2, 3, 5, 8, 16, 32, 64),
-    sigma_scales=(0.25, 0.5, 1.0, 2.0, 4.0),
-    use_parallel_sa: bool = False,
+   w: torch.Tensor,
+   include_param_bits: bool = True,
+   param_resolution: float = 1e-6,
+   nu_grid=(1.5, 2, 3, 5, 8, 16, 32, 64),
+   sigma_scales=(0.25, 0.5, 1.0, 2.0, 4.0),
+   use_parallel_sa: bool = False,
 ) -> torch.Tensor:
     """MDL bits for a parameter tensor under a Student-t(nu, sigma) prior.
 
-    Args:
-        use_parallel_sa: If True, use parallel simulated annealing instead of grid search
-    """
+   Args:
+       use_parallel_sa: If True, use parallel simulated annealing instead of grid search
+   """
+    from .debug_logging import log_tensor_moments, logger
+    
     x = w.flatten()
     x = x[torch.isfinite(x)]
     n = x.numel()
     if n == 0:
         return torch.tensor(0.0, device=w.device, dtype=w.dtype)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"=== Parameter Bits Analysis ===")
+        log_tensor_moments(w, "Original parameters")
+        log_tensor_moments(x, "Filtered parameters (finite only)")
 
     if use_parallel_sa:
         # Use parallel simulated annealing search
@@ -82,6 +87,12 @@ def parameter_bits_student_t_gradsafe(
                     if (best is None) or (bits < best[0]):
                         best = (bits, float(nu), float(sigma))
             nu_star, sigma_star = best[1], best[2]
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"  Optimal Student-t params: nu={nu_star:.4f}, sigma={sigma_star:.6f}")
+        # Show standardized parameters under optimal distribution
+        standardized = x / sigma_star
+        log_tensor_moments(standardized, "Standardized parameters (x/sigma)")
 
     dist = StudentT(df=nu_star, loc=0.0, scale=1.0)
     sigma_star = max(float(sigma_star), param_resolution)

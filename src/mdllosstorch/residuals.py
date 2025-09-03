@@ -1,5 +1,6 @@
 import math
 import torch
+import logging
 
 _LOG2 = math.log(2.0)
 
@@ -99,62 +100,35 @@ def residual_bits_transformed_softmin(
     return (w * B).sum()
 def _eps():
     return 1e-12
-def gauss_nml_bits(
-    residuals: torch.Tensor,
-    *,
-    data_resolution: float,
-    per_feature: bool = True,
-    include_quantization: bool = True,
-    ) -> torch.Tensor:
-    """
-    Absolute code length (in bits) for residuals using a Gaussian-with-unknown-variance
-    NML-style approximation, with a quantization-aware variance floor.
-    """
-    x = residuals
-    if x.ndim == 1:
-        x = x.view(-1, 1)
-
-    n, d = x.shape
-    n = max(int(n), 1)
-    d = max(int(d), 1)
-
-    delta = float(max(data_resolution, _eps()))
-    sigma2_floor = (delta ** 2) / 12.0
-
-    var = x.float().pow(2).mean(dim=0) - x.float().mean(dim=0).pow(2)
-    var = torch.clamp(var, min=sigma2_floor)
-
-    diff_per_feat = 0.5 * torch.log2(2.0 * math.pi * math.e * var.clamp_min(_eps()))
-    diff_bits = n * diff_per_feat.sum()
-
-    q_const = 0.0
-    if include_quantization:
-        q_const = n * d * math.log2(max(1.0 / delta, 1.0))
-
-    penalty_sigma = 0.5 * d * math.log2(float(n))
-
-    total_bits = diff_bits + q_const + penalty_sigma
-    return total_bits
 def residual_bits_transformed_gradsafe(
-    original: torch.Tensor,
-    reconstructed: torch.Tensor,
-    lam_grid: torch.Tensor = None,
-    method: str = "yeo-johnson",
-    offset_c: float = None,
-    include_param_bits: bool = True,
-    data_resolution: float = 1e-6,
-    use_parallel_sa: bool = False,
+   original: torch.Tensor,
+   reconstructed: torch.Tensor,
+   lam_grid: torch.Tensor = None,
+   method: str = "yeo-johnson",
+   offset_c: float = None,
+   include_param_bits: bool = True,
+   data_resolution: float = 1e-6,
+   use_parallel_sa: bool = False,
 ) -> torch.Tensor:
     """MDL residual bits with Yeo-Johnson/Box-Cox, Jacobian, lambda bits, and discretization.
+   
+   Args:
+       use_parallel_sa: If True, use parallel simulated annealing instead of grid search
+   """
+    from .debug_logging import log_tensor_moments, log_transform_comparison, logger
     
-    Args:
-        use_parallel_sa: If True, use parallel simulated annealing instead of grid search
-    """
     r_full = (original - reconstructed).flatten()
     mask = torch.isfinite(r_full)
     if not mask.any():
         return torch.tensor(float("inf"), device=original.device, dtype=original.dtype)
     r = r_full[mask]
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"=== Residual Transform Analysis ({method}) ===")
+        log_tensor_moments(original, "Original data")
+        log_tensor_moments(reconstructed, "Reconstructed data") 
+        log_tensor_moments(r_full, "Raw residuals")
+        log_tensor_moments(r, "Filtered residuals (finite only)")
 
     if use_parallel_sa:
         # Use parallel simulated annealing search
@@ -208,12 +182,22 @@ def residual_bits_transformed_gradsafe(
 
     if method == "yeo-johnson":
         t, logabsdet_nat = _yj_transform_and_logabsdet_jac(r, lam_star)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"  Optimal lambda: {lam_star:.4f}")
     else:
         if c_star is None:
             c_star = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
         t, logabsdet_nat = _bc_transform_and_logabsdet_jac(r, lam_star, c_star)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"  Optimal lambda: {lam_star:.4f}, offset c: {c_star:.6f}")
 
     t = t - t.mean()
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        log_transform_comparison(r, t, f"{method} transform")
+        var_t = _safe_var(t)
+        logger.debug(f"  Final variance after mean-centering: {var_t.item():.6f}")
+
     var_t = _safe_var(t)
     n = t.numel()
     bits_gauss = 0.5 * n * _log2(
@@ -226,3 +210,61 @@ def residual_bits_transformed_gradsafe(
     bits_disc = n * math.log2(1.0 / data_resolution)
 
     return bits_gauss + bits_jac + bits_param + bits_disc
+def gauss_nml_bits(
+   residuals: torch.Tensor,
+   *,
+   data_resolution: float,
+   per_feature: bool = True,
+   include_quantization: bool = True,
+   ) -> torch.Tensor:
+    """
+   Absolute code length (in bits) for residuals using a Gaussian-with-unknown-variance
+   NML-style approximation, with a quantization-aware variance floor.
+   """
+    from .debug_logging import log_tensor_moments, logger
+    
+    x = residuals
+    if x.ndim == 1:
+        x = x.view(-1, 1)
+
+    n, d = x.shape
+    n = max(int(n), 1)
+    d = max(int(d), 1)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"=== Gaussian NML Analysis ===")
+        log_tensor_moments(residuals, "Input residuals")
+        logger.debug(f"  Reshaped to: {n} samples x {d} features")
+
+    delta = float(max(data_resolution, _eps()))
+    sigma2_floor = (delta ** 2) / 12.0
+
+    var = x.float().pow(2).mean(dim=0) - x.float().mean(dim=0).pow(2)
+    var = torch.clamp(var, min=sigma2_floor)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"  Data resolution: {delta:.2e}")
+        logger.debug(f"  Variance floor: {sigma2_floor:.2e}")
+        if d == 1:
+            logger.debug(f"  Raw variance: {var.item():.6e}")
+            logger.debug(f"  Clamped variance: {var.item():.6e}")
+        else:
+            logger.debug(f"  Raw variance range: [{var.min().item():.2e}, {var.max().item():.2e}]")
+            logger.debug(f"  Mean variance: {var.mean().item():.2e}")
+
+    diff_per_feat = 0.5 * torch.log2(2.0 * math.pi * math.e * var.clamp_min(_eps()))
+    diff_bits = n * diff_per_feat.sum()
+
+    q_const = 0.0
+    if include_quantization:
+        q_const = n * d * math.log2(max(1.0 / delta, 1.0))
+
+    penalty_sigma = 0.5 * d * math.log2(float(n))
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"  Differential bits: {diff_bits.item():.2f}")
+        logger.debug(f"  Quantization bits: {q_const:.2f}")
+        logger.debug(f"  Parameter penalty: {penalty_sigma:.2f}")
+
+    total_bits = diff_bits + q_const + penalty_sigma
+    return total_bits
