@@ -9,9 +9,11 @@ from .parameters import (
 )
 from .mdlloss import compute_mdl, report_mdl  # noqa: F401
 __all__ = [
-  "MDLLoss",
-  "residual_bits_transformed_gradsafe",
-  "residual_bits_transformed_softmin",
-  "parameter_bits_student_t_gradsafe",
-  "parameter_bits_model_student_t",
+   "MDLLoss",
+   "residual_bits_transformed_gradsafe",
+   "residual_bits_transformed_softmin", 
+   "residual_bits_per_feature",
+   "parameter_bits_student_t_gradsafe",
+   "parameter_bits_model_student_t",
+   "parameter_bits_by_layer",
 ]

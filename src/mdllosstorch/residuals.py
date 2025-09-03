@@ -318,3 +318,104 @@ def residual_bits_transformed_gradsafe(
     bits_disc = n * math.log2(1.0 / data_resolution)
 
     return bits_gauss + bits_jac + bits_param + bits_disc
+def residual_bits_per_feature(
+    residuals: torch.Tensor,
+    method: str = "yeo-johnson", 
+    data_resolution: float = 1e-6,
+    use_parallel_sa: bool = False,
+) -> torch.Tensor:
+    """MDL bits with per-feature transforms - each feature gets its own lambda."""
+    from .debug_logging import log_tensor_moments, logger
+    
+    if residuals.ndim == 1:
+        residuals = residuals.view(-1, 1)
+    
+    n_samples, n_features = residuals.shape
+    total_bits = torch.tensor(0.0, device=residuals.device, dtype=residuals.dtype)
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"=== Per-Feature Residual Analysis ===")
+        logger.debug(f"  Processing {n_features} features with {n_samples} samples each")
+        log_tensor_moments(residuals, "All residuals")
+    
+    for feat_idx in range(n_features):
+        r = residuals[:, feat_idx]
+        r = r[torch.isfinite(r)]
+        
+        if r.numel() == 0:
+            continue
+            
+        # Find optimal transform for this feature
+        if use_parallel_sa:
+            from .parallel_sa import MDLParallelHyperparameterSearch
+            sa_search = MDLParallelHyperparameterSearch(memory_limit_mb=500)  # Smaller for single features
+            try:
+                lam_star = sa_search.search_lambda_params(r, method, data_resolution)
+            except:
+                lam_star = 0.0  # Fallback to identity
+        else:
+            # Simple grid search for this feature
+            lam_grid = torch.linspace(-2.0, 2.0, 21, device=r.device, dtype=r.dtype)  # Coarser grid
+            best_var = float('inf')
+            lam_star = 0.0
+            
+            for lam in lam_grid:
+                lam_val = float(lam.item())
+                try:
+                    if method == "yeo-johnson":
+                        t, _ = _yj_transform_and_logabsdet_jac(r, lam_val)
+                    elif method == "box-cox":
+                        c = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
+                        t, _ = _bc_transform_and_logabsdet_jac(r, lam_val, c)
+                    else:
+                        continue
+                        
+                    t = t - t.mean()
+                    var_t = torch.var(t, unbiased=False)
+                    if var_t < best_var:
+                        best_var = var_t
+                        lam_star = lam_val
+                except:
+                    continue
+        
+        # Apply transform and compute bits for this feature
+        try:
+            if method == "yeo-johnson":
+                t, logabsdet_nat = _yj_transform_and_logabsdet_jac(r, lam_star)
+            elif method == "box-cox":
+                c = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
+                t, logabsdet_nat = _bc_transform_and_logabsdet_jac(r, lam_star, c)
+            else:
+                # Identity transform
+                t = r
+                logabsdet_nat = 0.0
+                
+            t = t - t.mean()
+            var_t = _safe_var(t)
+            n = t.numel()
+            
+            # Bits for this feature
+            bits_gauss = 0.5 * n * _log2(torch.tensor(2.0 * math.pi * math.e, device=r.device)) + 0.5 * n * _log2(var_t)
+            bits_jac = -(logabsdet_nat / _LOG2)
+            bits_param = 0.5 * math.log2(max(2, n))  # Cost to encode lambda for this feature
+            bits_disc = n * math.log2(1.0 / data_resolution)
+            
+            feature_bits = bits_gauss + bits_jac + bits_param + bits_disc
+            total_bits = total_bits + feature_bits
+            
+            if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 10) == 0:
+                logger.debug(f"    Feature {feat_idx}: lambda={lam_star:.3f}, bits={feature_bits:.1f}")
+                
+        except Exception as e:
+            # Fallback to identity for problematic features
+            n = r.numel()
+            var_r = _safe_var(r)
+            bits_gauss = 0.5 * n * _log2(torch.tensor(2.0 * math.pi * math.e, device=r.device)) + 0.5 * n * _log2(var_r)
+            bits_disc = n * math.log2(1.0 / data_resolution)
+            feature_bits = bits_gauss + bits_disc
+            total_bits = total_bits + feature_bits
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"  Total per-feature bits: {total_bits.item():.1f}")
+        
+    return total_bits

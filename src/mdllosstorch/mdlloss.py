@@ -14,8 +14,10 @@ class MDLLoss(nn.Module):
                 param_resolution: float = 1e-6,
                 include_transform_param_bits: bool = True,
                 lam_grid: torch.Tensor = None,
-                coder: str = "gauss_nml",
-                use_parallel_sa: bool = False):
+                coder: str = "per_feature",  # Changed default
+                use_parallel_sa: bool = False,
+                per_feature_residuals: bool = True,
+                per_layer_parameters: bool = True):
         super().__init__()
         self.method = method
         self.data_resolution = float(data_resolution)
@@ -23,24 +25,30 @@ class MDLLoss(nn.Module):
         self.coder = coder
         self.include_transform_param_bits = include_transform_param_bits
         self.use_parallel_sa = use_parallel_sa
+        self.per_feature_residuals = per_feature_residuals
+        self.per_layer_parameters = per_layer_parameters
         self._lam_grid = lam_grid
     def forward(self, original: torch.Tensor, reconstructed: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
-        if self.coder == "gauss_nml":
-            # NEW: quantization-aware, variance-floored, absolute residual coder
-            residuals = original - reconstructed
+        residuals = original - reconstructed
+        
+        # Choose residual encoding method
+        if self.per_feature_residuals:
+            from .residuals import residual_bits_per_feature
+            res_bits = residual_bits_per_feature(
+                residuals,
+                method=self.method,
+                data_resolution=self.data_resolution,
+                use_parallel_sa=self.use_parallel_sa,
+            )
+        elif self.coder == "gauss_nml":
             res_bits = gauss_nml_bits(
                 residuals,
                 data_resolution=self.data_resolution,
                 per_feature=True,
                 include_quantization=True,
             )
-            par_bits = parameter_bits_model_student_t(
-                model, include_param_bits=True, param_resolution=self.param_resolution,
-                use_parallel_sa=self.use_parallel_sa
-            )
-            return res_bits + par_bits
         else:
-            # Existing transform-based residual coder
+            # Original single-transform approach
             lam_grid = self._lam_grid.to(device=original.device, dtype=original.dtype) if self._lam_grid is not None else None
             res_bits = residual_bits_transformed_gradsafe(
                 original=original,
@@ -51,11 +59,25 @@ class MDLLoss(nn.Module):
                 data_resolution=self.data_resolution,
                 use_parallel_sa=self.use_parallel_sa,
             )
+        
+        # Choose parameter encoding method  
+        if self.per_layer_parameters:
+            from .parameters import parameter_bits_by_layer
+            par_bits = parameter_bits_by_layer(
+                model,
+                param_resolution=self.param_resolution,
+                use_parallel_sa=self.use_parallel_sa,
+            )
+        else:
+            # Original approach - all parameters together
             par_bits = parameter_bits_model_student_t(
-                model, include_param_bits=True, param_resolution=self.param_resolution,
+                model, 
+                include_param_bits=True, 
+                param_resolution=self.param_resolution,
                 use_parallel_sa=self.use_parallel_sa
             )
-            return res_bits + par_bits
+        
+        return res_bits + par_bits
 
 # === Auto data-resolution + convenience wrappers ===
 

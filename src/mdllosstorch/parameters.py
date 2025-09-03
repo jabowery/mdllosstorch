@@ -116,3 +116,68 @@ def parameter_bits_student_t_gradsafe(
         logger.debug(f"  Total bits: {bits.item():.2f}")
     
     return bits
+def parameter_bits_by_layer(
+    model: torch.nn.Module,
+    param_resolution: float = 1e-6,
+    use_parallel_sa: bool = False,
+) -> torch.Tensor:
+    """MDL bits with per-layer parameter modeling - each layer type gets separate treatment."""
+    from .debug_logging import log_tensor_moments, logger
+    
+    device = next((p.device for p in model.parameters()), torch.device("cpu"))
+    total_bits = torch.tensor(0.0, device=device)
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"=== Per-Layer Parameter Analysis ===")
+    
+    # Group parameters by layer type and properties
+    weight_groups = []
+    bias_groups = []
+    norm_groups = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+            
+        # Skip parameters that are essentially constant
+        if param.std() < 1e-10:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"  Skipping constant parameter: {name} (std={param.std().item():.2e})")
+            continue
+            
+        # Categorize parameters
+        if 'weight' in name.lower() and param.ndim >= 2:
+            weight_groups.append((name, param))
+        elif 'bias' in name.lower():
+            bias_groups.append((name, param))
+        elif any(x in name.lower() for x in ['norm', 'scale']):
+            norm_groups.append((name, param))
+        else:
+            # Unknown - treat as weight
+            weight_groups.append((name, param))
+    
+    # Process each group separately
+    for group_name, param_list in [("Weight matrices", weight_groups), 
+                                   ("Bias vectors", bias_groups), 
+                                   ("Norm parameters", norm_groups)]:
+        if not param_list:
+            continue
+            
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"  Processing {len(param_list)} {group_name}")
+            
+        for name, param in param_list:
+            param_bits = parameter_bits_student_t_gradsafe(
+                param, 
+                param_resolution=param_resolution,
+                use_parallel_sa=use_parallel_sa
+            )
+            total_bits = total_bits + param_bits
+            
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"    {name}: {param_bits.item():.1f} bits")
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"  Total parameter bits: {total_bits.item():.1f}")
+        
+    return total_bits
