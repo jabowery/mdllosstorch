@@ -100,116 +100,6 @@ def residual_bits_transformed_softmin(
     return (w * B).sum()
 def _eps():
     return 1e-12
-def residual_bits_transformed_gradsafe(
-   original: torch.Tensor,
-   reconstructed: torch.Tensor,
-   lam_grid: torch.Tensor = None,
-   method: str = "yeo-johnson",
-   offset_c: float = None,
-   include_param_bits: bool = True,
-   data_resolution: float = 1e-6,
-   use_parallel_sa: bool = False,
-) -> torch.Tensor:
-    """MDL residual bits with Yeo-Johnson/Box-Cox, Jacobian, lambda bits, and discretization.
-   
-   Args:
-       use_parallel_sa: If True, use parallel simulated annealing instead of grid search
-   """
-    from .debug_logging import log_tensor_moments, log_transform_comparison, logger
-    
-    r_full = (original - reconstructed).flatten()
-    mask = torch.isfinite(r_full)
-    if not mask.any():
-        return torch.tensor(float("inf"), device=original.device, dtype=original.dtype)
-    r = r_full[mask]
-
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"=== Residual Transform Analysis ({method}) ===")
-        log_tensor_moments(original, "Original data")
-        log_tensor_moments(reconstructed, "Reconstructed data") 
-        log_tensor_moments(r_full, "Raw residuals")
-        log_tensor_moments(r, "Filtered residuals (finite only)")
-
-    if use_parallel_sa:
-        # Use parallel simulated annealing search
-        from .parallel_sa import MDLParallelHyperparameterSearch
-        
-        if not hasattr(residual_bits_transformed_gradsafe, '_sa_search'):
-            residual_bits_transformed_gradsafe._sa_search = MDLParallelHyperparameterSearch()
-        
-        with torch.no_grad():
-            rd = r.detach()
-            lam_star = residual_bits_transformed_gradsafe._sa_search.search_lambda_params(rd, method, data_resolution)
-            if method == "box-cox" and offset_c is None:
-                c_star = float(torch.clamp(-(rd.min()) + 1e-6, min=1e-9).item())
-            else:
-                c_star = offset_c
-    else:
-        # Original grid search implementation
-        if lam_grid is None:
-            lam_grid = torch.linspace(-2.0, 2.0, 81, device=r.device, dtype=r.dtype)
-
-        with torch.no_grad():
-            rd = r.detach()
-            best = None
-            for lam in lam_grid.tolist():
-                if method == "yeo-johnson":
-                    t, logabsdet_nat = _yj_transform_and_logabsdet_jac(rd, float(lam))
-                    c = None
-                elif method == "box-cox":
-                    c = offset_c
-                    if c is None:
-                        c = float(torch.clamp(-(rd.min()) + 1e-6, min=1e-9).item())
-                    t, logabsdet_nat = _bc_transform_and_logabsdet_jac(rd, float(lam), c)
-                else:
-                    raise ValueError("method must be 'yeo-johnson' or 'box-cox'")
-
-                t = t - t.mean()
-                var_t = _safe_var(t)
-                n = t.numel()
-                bits_gauss = 0.5 * n * _log2(
-                    torch.tensor(2.0 * math.pi * math.e, device=rd.device, dtype=rd.dtype)
-                ) + 0.5 * n * _log2(var_t)
-                bits_jac = -(logabsdet_nat / _LOG2)
-                bits_param = (0.5 * math.log2(max(2, n))) if include_param_bits else 0.0
-                if method == "box-cox" and offset_c is None:
-                    bits_param += 0.5 * math.log2(max(2, n))
-                bits_disc = n * math.log2(1.0 / data_resolution)
-                total = bits_gauss + bits_jac + bits_param + bits_disc
-                if (best is None) or (total < best[0]):
-                    best = (total, float(lam), c)
-            lam_star, c_star = best[1], best[2]
-
-    if method == "yeo-johnson":
-        t, logabsdet_nat = _yj_transform_and_logabsdet_jac(r, lam_star)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"  Optimal lambda: {lam_star:.4f}")
-    else:
-        if c_star is None:
-            c_star = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
-        t, logabsdet_nat = _bc_transform_and_logabsdet_jac(r, lam_star, c_star)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"  Optimal lambda: {lam_star:.4f}, offset c: {c_star:.6f}")
-
-    t = t - t.mean()
-    
-    if logger.isEnabledFor(logging.DEBUG):
-        log_transform_comparison(r, t, f"{method} transform")
-        var_t = _safe_var(t)
-        logger.debug(f"  Final variance after mean-centering: {var_t.item():.6f}")
-
-    var_t = _safe_var(t)
-    n = t.numel()
-    bits_gauss = 0.5 * n * _log2(
-        torch.tensor(2.0 * math.pi * math.e, device=r.device, dtype=r.dtype)
-    ) + 0.5 * n * _log2(var_t)
-    bits_jac = -(logabsdet_nat / _LOG2)
-    bits_param = (0.5 * math.log2(max(2, n))) if include_param_bits else 0.0
-    if method == "box-cox" and offset_c is None and method == "box-cox":
-        bits_param += 0.5 * math.log2(max(2, n))
-    bits_disc = n * math.log2(1.0 / data_resolution)
-
-    return bits_gauss + bits_jac + bits_param + bits_disc
 def gauss_nml_bits(
     residuals: torch.Tensor,
     *,
@@ -275,3 +165,156 @@ def gauss_nml_bits(
 
     total_bits = diff_bits + q_const + penalty_sigma
     return total_bits
+def residual_bits_transformed_gradsafe(
+    original: torch.Tensor,
+    reconstructed: torch.Tensor,
+    lam_grid: torch.Tensor = None,
+    method: str = "yeo-johnson",
+    offset_c: float = None,
+    include_param_bits: bool = True,
+    data_resolution: float = 1e-6,
+    use_parallel_sa: bool = False,
+) -> torch.Tensor:
+    """MDL residual bits with Yeo-Johnson/Box-Cox, Jacobian, lambda bits, and discretization.
+    
+    Args:
+        use_parallel_sa: If True, use parallel simulated annealing instead of grid search
+    """
+    from .debug_logging import log_tensor_moments, log_transform_comparison, logger
+    
+    r_full = (original - reconstructed).flatten()
+    mask = torch.isfinite(r_full)
+    if not mask.any():
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("  TRANSFORM SEARCH FAILED: No finite residuals found")
+            logger.debug("  FALLBACK: Using identity transform (no transform applied)")
+        return torch.tensor(float("inf"), device=original.device, dtype=original.dtype)
+    r = r_full[mask]
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"=== Residual Transform Analysis ({method}) ===")
+        log_tensor_moments(original, "Original data")
+        log_tensor_moments(reconstructed, "Reconstructed data") 
+        log_tensor_moments(r_full, "Raw residuals")
+        log_tensor_moments(r, "Filtered residuals (finite only)")
+
+    lam_star = None
+    c_star = None
+    search_failed = False
+
+    if use_parallel_sa:
+        # Use parallel simulated annealing search
+        try:
+            from .parallel_sa import MDLParallelHyperparameterSearch
+            
+            if not hasattr(residual_bits_transformed_gradsafe, '_sa_search'):
+                residual_bits_transformed_gradsafe._sa_search = MDLParallelHyperparameterSearch()
+            
+            with torch.no_grad():
+                rd = r.detach()
+                lam_star = residual_bits_transformed_gradsafe._sa_search.search_lambda_params(rd, method, data_resolution)
+                if method == "box-cox" and offset_c is None:
+                    c_star = float(torch.clamp(-(rd.min()) + 1e-6, min=1e-9).item())
+                else:
+                    c_star = offset_c
+                    
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"  PARALLEL SA SEARCH: Found lambda={lam_star:.4f}")
+                if method == "box-cox":
+                    logger.debug(f"  PARALLEL SA SEARCH: Found c={c_star:.6f}")
+                    
+        except Exception as e:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"  PARALLEL SA SEARCH FAILED: {str(e)}")
+            search_failed = True
+    else:
+        # Original grid search implementation
+        try:
+            if lam_grid is None:
+                lam_grid = torch.linspace(-2.0, 2.0, 81, device=r.device, dtype=r.dtype)
+
+            with torch.no_grad():
+                rd = r.detach()
+                best = None
+                for lam in lam_grid.tolist():
+                    if method == "yeo-johnson":
+                        t, logabsdet_nat = _yj_transform_and_logabsdet_jac(rd, float(lam))
+                        c = None
+                    elif method == "box-cox":
+                        c = offset_c
+                        if c is None:
+                            c = float(torch.clamp(-(rd.min()) + 1e-6, min=1e-9).item())
+                        t, logabsdet_nat = _bc_transform_and_logabsdet_jac(rd, float(lam), c)
+                    else:
+                        raise ValueError("method must be 'yeo-johnson' or 'box-cox'")
+
+                    t = t - t.mean()
+                    var_t = _safe_var(t)
+                    n = t.numel()
+                    bits_gauss = 0.5 * n * _log2(
+                        torch.tensor(2.0 * math.pi * math.e, device=rd.device, dtype=rd.dtype)
+                    ) + 0.5 * n * _log2(var_t)
+                    bits_jac = -(logabsdet_nat / _LOG2)
+                    bits_param = (0.5 * math.log2(max(2, n))) if include_param_bits else 0.0
+                    if method == "box-cox" and offset_c is None:
+                        bits_param += 0.5 * math.log2(max(2, n))
+                    bits_disc = n * math.log2(1.0 / data_resolution)
+                    total = bits_gauss + bits_jac + bits_param + bits_disc
+                    if (best is None) or (total < best[0]):
+                        best = (total, float(lam), c)
+                        
+                if best is None:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"  GRID SEARCH FAILED: No valid lambda found in grid search")
+                    search_failed = True
+                else:
+                    lam_star, c_star = best[1], best[2]
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"  GRID SEARCH: Found lambda={lam_star:.4f} with {len(lam_grid)} candidates")
+                        if method == "box-cox":
+                            logger.debug(f"  GRID SEARCH: Found c={c_star:.6f}")
+                            
+        except Exception as e:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"  GRID SEARCH FAILED: {str(e)}")
+            search_failed = True
+
+    # Handle search failure with identity fallback
+    if search_failed or lam_star is None:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("  TRANSFORM SEARCH FAILED: Using identity transform (lambda=0)")
+            logger.debug("  FALLBACK: No transform applied to residuals")
+        lam_star = 0.0
+        c_star = None if method == "yeo-johnson" else float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
+
+    # Apply final transform
+    if method == "yeo-johnson":
+        t, logabsdet_nat = _yj_transform_and_logabsdet_jac(r, lam_star)
+    else:
+        if c_star is None:
+            c_star = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
+        t, logabsdet_nat = _bc_transform_and_logabsdet_jac(r, lam_star, c_star)
+
+    t = t - t.mean()
+    
+    if logger.isEnabledFor(logging.DEBUG):
+        if abs(lam_star) < 1e-6:
+            logger.debug("  FINAL TRANSFORM: Identity (lambda ≈ 0)")
+        else:
+            logger.debug(f"  FINAL TRANSFORM: {method} with lambda={lam_star:.4f}")
+        log_transform_comparison(r, t, f"{method} transform")
+        var_t = _safe_var(t)
+        logger.debug(f"  Final variance after mean-centering: {var_t.item():.6f}")
+
+    var_t = _safe_var(t)
+    n = t.numel()
+    bits_gauss = 0.5 * n * _log2(
+        torch.tensor(2.0 * math.pi * math.e, device=r.device, dtype=r.dtype)
+    ) + 0.5 * n * _log2(var_t)
+    bits_jac = -(logabsdet_nat / _LOG2)
+    bits_param = (0.5 * math.log2(max(2, n))) if include_param_bits else 0.0
+    if method == "box-cox" and offset_c is None and method == "box-cox":
+        bits_param += 0.5 * math.log2(max(2, n))
+    bits_disc = n * math.log2(1.0 / data_resolution)
+
+    return bits_gauss + bits_jac + bits_param + bits_disc
