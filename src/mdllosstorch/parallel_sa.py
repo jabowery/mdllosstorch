@@ -19,19 +19,6 @@ class ParallelAdaptiveAnnealingSampler:
     def _default_param_bounds(self):
         return {"nu": (1.5, 64.0), "sigma_scale": (0.25, 4.0), "lambda": (-2.0, 2.0)}
 
-    def sample_candidates(self, current_params=None):
-        """Generate n_parallel candidate parameter sets using adaptive sampling"""
-        candidates = []
-        for _i in range(self.n_parallel):
-            if self.current_best is None or torch.rand(1) < 0.3:
-                # Random exploration (30% chance)
-                candidate = self._random_sample()
-            else:
-                # Temperature-based perturbation around best
-                candidate = self._perturb_around_best(self.current_best, self.temperature)
-            candidates.append(candidate)
-        return candidates
-
     def _random_sample(self):
         """Sample random parameters within bounds"""
         nu = (
@@ -72,43 +59,108 @@ class ParallelAdaptiveAnnealingSampler:
         )
 
         return {"nu": float(nu), "sigma_scale": float(sigma_scale), "lambda": float(lambda_val)}
-
+    def sample_candidates(self, current_params=None):
+        """Generate n_parallel candidate parameter sets using adaptive sampling"""
+        candidates = []
+        for _i in range(self.n_parallel):
+            try:
+                if self.current_best is None or torch.rand(1) < 0.3:
+                    # Random exploration (30% chance)
+                    candidate = self._random_sample()
+                else:
+                    # Temperature-based perturbation around best
+                    candidate = self._perturb_around_best(self.current_best, self.temperature)
+                candidates.append(candidate)
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to generate candidate {_i}: {e}")
+                logger.error(f"param_bounds: {self.param_bounds}")
+                logger.error(f"current_best: {self.current_best}")
+                # Add a fallback candidate
+                candidates.append(self._get_fallback_candidate())
+        return candidates
+    def _get_fallback_candidate(self):
+        """Generate a safe fallback candidate with all required keys"""
+        candidate = {}
+        if "nu" in self.param_bounds:
+            candidate["nu"] = 2.0  # Safe default
+        if "sigma_scale" in self.param_bounds:
+            candidate["sigma_scale"] = 1.0  # Safe default
+        if "lambda" in self.param_bounds:
+            candidate["lambda"] = 0.0  # Safe default
+        return candidate
     def update_and_accept(self, candidates, scores):
         """Update best solution using Metropolis acceptance criterion"""
-        best_idx = torch.argmin(scores)
-        best_candidate = candidates[best_idx]
-        best_score = float(scores[best_idx])
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        try:
+            best_idx = torch.argmin(scores)
+            best_candidate = candidates[best_idx]
+            best_score = float(scores[best_idx])
+            
+            # Validate best_candidate has required keys
+            required_keys = list(self.param_bounds.keys())
+            missing_keys = [k for k in required_keys if k not in best_candidate]
+            if missing_keys:
+                logger.error(f"Best candidate missing keys: {missing_keys}")
+                logger.error(f"Best candidate: {best_candidate}")
+                logger.error(f"Required keys: {required_keys}")
+                # Use fallback
+                best_candidate = self._get_fallback_candidate()
 
-        # Always accept improvements
-        if best_score < self.current_best_score:
-            self.current_best = best_candidate
-            self.current_best_score = best_score
-            accepted = True
-        else:
-            # Probabilistic acceptance for worse solutions
-            delta = best_score - self.current_best_score
-            # Ensure we work with tensors for torch.exp()
-            delta_tensor = torch.tensor(delta, dtype=scores.dtype, device=scores.device)
-            temp_tensor = torch.tensor(
-                max(self.temperature, 1e-10), dtype=scores.dtype, device=scores.device
-            )
-            accept_prob = torch.exp(-delta_tensor / temp_tensor)
-            if torch.rand(1, device=scores.device) < accept_prob:
+            # Always accept improvements
+            if best_score < self.current_best_score:
                 self.current_best = best_candidate
                 self.current_best_score = best_score
                 accepted = True
             else:
-                accepted = False
+                # Probabilistic acceptance for worse solutions
+                delta = best_score - self.current_best_score
+                # Ensure we work with tensors for torch.exp()
+                delta_tensor = torch.tensor(delta, dtype=scores.dtype, device=scores.device)
+                temp_tensor = torch.tensor(
+                    max(self.temperature, 1e-10), dtype=scores.dtype, device=scores.device
+                )
+                accept_prob = torch.exp(-delta_tensor / temp_tensor)
+                if torch.rand(1, device=scores.device) < accept_prob:
+                    self.current_best = best_candidate
+                    self.current_best_score = best_score
+                    accepted = True
+                else:
+                    accepted = False
 
-        # Cool down temperature
-        self.temperature *= self.cooling_rate
-        self.iteration_count += 1
+            # Cool down temperature
+            self.temperature *= self.cooling_rate
+            self.iteration_count += 1
 
-        # Reheat if temperature gets too low (adaptive restart)
-        if self.temperature < 0.01 and self.iteration_count % 50 == 0:
-            self.temperature = self.initial_temp * 0.5
+            # Reheat if temperature gets too low (adaptive restart)
+            if self.temperature < 0.01 and self.iteration_count % 50 == 0:
+                self.temperature = self.initial_temp * 0.5
 
-        return self.current_best, accepted
+            # Final validation
+            if self.current_best is None:
+                logger.error("current_best is None after update_and_accept")
+                self.current_best = self._get_fallback_candidate()
+                
+            required_keys = list(self.param_bounds.keys())
+            missing_keys = [k for k in required_keys if k not in self.current_best]
+            if missing_keys:
+                logger.error(f"Final current_best missing keys: {missing_keys}")
+                self.current_best = self._get_fallback_candidate()
+
+            return self.current_best, accepted
+            
+        except Exception as e:
+            logger.error(f"Exception in update_and_accept: {e}")
+            logger.error(f"candidates: {candidates}")
+            logger.error(f"scores: {scores}")
+            # Return safe defaults
+            fallback = self._get_fallback_candidate()
+            self.current_best = fallback
+            self.current_best_score = float('inf')
+            return fallback, False
 
 
 class MDLParallelHyperparameterSearch:
@@ -172,20 +224,6 @@ class MDLParallelHyperparameterSearch:
         self.memory_limit_mb = memory_limit_mb
         self.param_sampler = None
         self.lambda_sampler = None
-
-    def search_student_t_params(self, parameters, param_resolution=1e-6):
-        """Search for optimal Student-t parameters using parallel SA"""
-        if self.param_sampler is None:
-            self.param_sampler = ParallelAdaptiveAnnealingSampler(
-                n_parallel=self.adaptive_batch_size(len(parameters)),
-                param_bounds={"nu": (1.5, 64.0), "sigma_scale": (0.25, 4.0), "lambda": (-2.0, 2.0)},
-            )
-
-        candidates = self.param_sampler.sample_candidates()
-        scores = self._evaluate_student_t_candidates(parameters, candidates, param_resolution)
-        best_params, accepted = self.param_sampler.update_and_accept(candidates, scores)
-
-        return best_params["nu"], best_params["sigma_scale"]
 
     def search_lambda_params(self, residuals, method="yeo-johnson", data_resolution=1e-6):
         """Search for optimal transformation lambda using parallel SA"""
@@ -439,3 +477,77 @@ class MDLParallelHyperparameterSearch:
         logabsdet_total = logabsdet_per_element.sum(dim=1)  # [n_candidates]
 
         return transformed, logabsdet_total
+    def search_student_t_params(self, parameters, param_resolution=1e-6):
+        """Search for optimal Student-t parameters using parallel SA"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        try:
+            if self.param_sampler is None:
+                self.param_sampler = ParallelAdaptiveAnnealingSampler(
+                    n_parallel=self.adaptive_batch_size(len(parameters)),
+                    param_bounds={"nu": (1.5, 64.0), "sigma_scale": (0.25, 4.0), "lambda": (-2.0, 2.0)},
+                )
+
+            logger.debug(f"Generating candidates with param_bounds: {self.param_sampler.param_bounds}")
+            candidates = self.param_sampler.sample_candidates()
+            
+            if not candidates:
+                raise ValueError("No candidates generated by sampler")
+                
+            logger.debug(f"Generated {len(candidates)} candidates: {candidates}")
+            
+            scores = self._evaluate_student_t_candidates(parameters, candidates, param_resolution)
+            logger.debug(f"Scores: {scores}")
+            
+            best_params, accepted = self.param_sampler.update_and_accept(candidates, scores)
+            logger.debug(f"Best params after update_and_accept: {best_params}")
+            
+            if best_params is None:
+                raise ValueError("best_params is None")
+                
+            if 'nu' not in best_params:
+                raise ValueError(f"'nu' not in best_params: {best_params}")
+                
+            if 'sigma_scale' not in best_params:
+                raise ValueError(f"'sigma_scale' not in best_params: {best_params}")
+
+            return best_params["nu"], best_params["sigma_scale"]
+            
+        except Exception as e:
+            logger.error(f"Parallel SA search failed: {e}")
+            logger.error(f"Exception type: {type(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            # Fallback to simple grid search
+            with torch.no_grad():
+                xd = parameters.detach()
+                med = torch.median(xd.abs()).item() + 1e-12
+                base = max(med / 0.6745, param_resolution)
+                
+                # Simple grid search over common values
+                nu_grid = [1.5, 2, 3, 5, 8, 16, 32, 64]
+                sigma_scales = [0.25, 0.5, 1.0, 2.0, 4.0]
+                sigmas = [base * s for s in sigma_scales]
+                
+                best = None
+                from torch.distributions import StudentT
+                for nu in nu_grid:
+                    dist = StudentT(df=float(nu), loc=0.0, scale=1.0)
+                    for sigma in sigmas:
+                        nll_nat = -dist.log_prob(xd / sigma).sum() + xd.numel() * math.log(sigma)
+                        bits = nll_nat / math.log(2.0)
+                        if (best is None) or (bits < best[0]):
+                            best = (bits, float(nu), float(sigma))
+                
+                if best is None:
+                    logger.error("Grid search also failed, using ultimate fallback")
+                    return 2.0, 1.0
+                    
+                nu_star = best[1]
+                sigma_star = best[2]
+                sigma_scale = sigma_star / base
+                
+                logger.debug(f"Grid search fallback result: nu={nu_star}, sigma_scale={sigma_scale}")
+                return nu_star, sigma_scale
