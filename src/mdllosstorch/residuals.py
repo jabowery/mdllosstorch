@@ -318,11 +318,48 @@ def residual_bits_transformed_gradsafe(
     bits_disc = n * math.log2(1.0 / data_resolution)
 
     return bits_gauss + bits_jac + bits_param + bits_disc
+_feature_transform_cache = {}
+def _get_feature_moments(tensor: torch.Tensor) -> tuple:
+    """Get key statistical moments for caching decisions."""
+    with torch.no_grad():
+        mean_val = tensor.mean().item()
+        var_val = tensor.var(unbiased=False).item()
+        
+        # For efficiency, only compute higher moments if variance is significant
+        if var_val < 1e-10:
+            return (mean_val, var_val, 0.0, 0.0)
+            
+        std_val = var_val ** 0.5
+        centered = tensor - mean_val
+        skew = (centered ** 3).mean().item() / (std_val ** 3)
+        kurt = (centered ** 4).mean().item() / (var_val ** 2) - 3.0
+        
+        return (mean_val, var_val, skew, kurt)
+def _moments_changed_significantly(old_moments: tuple, new_moments: tuple, 
+                                 rel_tol: float = 0.1, abs_tol: float = 0.01) -> bool:
+    """Check if moments have changed enough to invalidate cached transform."""
+    for old, new in zip(old_moments, new_moments):
+        # Skip comparison if both are very small
+        if abs(old) < abs_tol and abs(new) < abs_tol:
+            continue
+            
+        # Relative change check
+        if abs(old) > abs_tol:
+            rel_change = abs(new - old) / abs(old)
+            if rel_change > rel_tol:
+                return True
+        else:
+            # Absolute change for small values
+            if abs(new - old) > abs_tol:
+                return True
+                
+    return False
 def residual_bits_per_feature(
     residuals: torch.Tensor,
     method: str = "yeo-johnson", 
     data_resolution: float = 1e-6,
     use_parallel_sa: bool = False,
+    cache_transforms: bool = True,
 ) -> torch.Tensor:
     """MDL bits with per-feature transforms - each feature gets its own lambda."""
     from .debug_logging import log_tensor_moments, log_transform_comparison, logger
@@ -337,12 +374,15 @@ def residual_bits_per_feature(
         logger.debug(f"=== Per-Feature Residual Analysis ===")
         logger.debug(f"  Processing {n_features} features with {n_samples} samples each")
         logger.debug(f"  Parallel SA enabled: {use_parallel_sa}")
+        logger.debug(f"  Transform caching enabled: {cache_transforms}")
         log_tensor_moments(residuals, "All residuals")
     
     # Track statistics for reporting
     transform_improvements = []
     sa_successes = 0
     sa_failures = 0
+    cache_hits = 0
+    cache_misses = 0
     
     for feat_idx in range(n_features):
         r = residuals[:, feat_idx]
@@ -351,73 +391,93 @@ def residual_bits_per_feature(
         if r.numel() == 0:
             continue
             
-        # Log original feature statistics
-        r_original_var = torch.var(r, unbiased=False).item()
+        # Get current moments for caching
+        current_moments = _get_feature_moments(r)
+        cache_key = f"{method}_{feat_idx}_{data_resolution}"
+        
+        # Check cache
+        use_cached_transform = False
+        lam_star = 0.0
+        
+        if cache_transforms and cache_key in _feature_transform_cache:
+            cached_moments, cached_lambda = _feature_transform_cache[cache_key]
+            if not _moments_changed_significantly(cached_moments, current_moments):
+                lam_star = cached_lambda
+                use_cached_transform = True
+                cache_hits += 1
+                transform_method_used = "cached"
+            else:
+                cache_misses += 1
+        else:
+            cache_misses += 1
+            
+        # Log original feature statistics for detailed features
+        r_original_var = current_moments[1]  # variance
         r_original_skew = None
         r_original_kurt = None
         
         if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
-            # Calculate skewness and kurtosis for detailed features
-            with torch.no_grad():
-                r_mean = r.mean()
-                r_std = r.std(unbiased=False)
-                if r_std > 1e-12:
-                    r_centered = r - r_mean
-                    r_original_skew = (r_centered ** 3).mean().item() / (r_std ** 3).item()
-                    r_original_kurt = (r_centered ** 4).mean().item() / (r_std ** 4).item() - 3.0
+            r_original_skew = current_moments[2]
+            r_original_kurt = current_moments[3]
             
             logger.debug(f"  === Feature {feat_idx} Transform Analysis ===")
             log_tensor_moments(r, f"Feature {feat_idx} before transform")
+            if use_cached_transform:
+                logger.debug(f"    CACHE HIT: Using cached lambda={lam_star:.4f}")
             
-        # Find optimal transform for this feature
-        transform_method_used = "unknown"
-        if use_parallel_sa:
-            from .parallel_sa import MDLParallelHyperparameterSearch
-            sa_search = MDLParallelHyperparameterSearch(memory_limit_mb=500)
-            try:
-                lam_star = sa_search.search_lambda_params(r, method, data_resolution)
-                sa_successes += 1
-                transform_method_used = "parallel_sa"
-                if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
-                    logger.debug(f"    PARALLEL SA SUCCESS: lambda={lam_star:.4f}")
-            except Exception as e:
-                sa_failures += 1
-                lam_star = 0.0
-                transform_method_used = f"parallel_sa_failed_{type(e).__name__}"
-                if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
-                    logger.debug(f"    PARALLEL SA FAILED: {e}")
-                    logger.debug(f"    Falling back to identity transform (lambda=0.0)")
-        else:
-            # Grid search for this feature
-            transform_method_used = "grid_search"
-            lam_grid = torch.linspace(-2.0, 2.0, 21, device=r.device, dtype=r.dtype)
-            best_var = float('inf')
-            lam_star = 0.0
-            
-            if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
-                logger.debug(f"    GRID SEARCH: Testing {len(lam_grid)} lambda values")
-            
-            for lam in lam_grid:
-                lam_val = float(lam.item())
+        # Find optimal transform if not cached
+        if not use_cached_transform:
+            if use_parallel_sa:
+                from .parallel_sa import MDLParallelHyperparameterSearch
+                sa_search = MDLParallelHyperparameterSearch(memory_limit_mb=500)
                 try:
-                    if method == "yeo-johnson":
-                        t, _ = _yj_transform_and_logabsdet_jac(r, lam_val)
-                    elif method == "box-cox":
-                        c = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
-                        t, _ = _bc_transform_and_logabsdet_jac(r, lam_val, c)
-                    else:
+                    lam_star = sa_search.search_lambda_params(r, method, data_resolution)
+                    sa_successes += 1
+                    transform_method_used = "parallel_sa"
+                    if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                        logger.debug(f"    PARALLEL SA SUCCESS: lambda={lam_star:.4f}")
+                except Exception as e:
+                    sa_failures += 1
+                    lam_star = 0.0
+                    transform_method_used = f"parallel_sa_failed_{type(e).__name__}"
+                    if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                        logger.debug(f"    PARALLEL SA FAILED: {e}")
+                        logger.debug(f"    Falling back to identity transform (lambda=0.0)")
+            else:
+                # Grid search for this feature
+                transform_method_used = "grid_search"
+                lam_grid = torch.linspace(-2.0, 2.0, 11, device=r.device, dtype=r.dtype)  # Reduced from 21 to 11
+                best_var = float('inf')
+                lam_star = 0.0
+                
+                if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                    logger.debug(f"    GRID SEARCH: Testing {len(lam_grid)} lambda values")
+                
+                for lam in lam_grid:
+                    lam_val = float(lam.item())
+                    try:
+                        if method == "yeo-johnson":
+                            t, _ = _yj_transform_and_logabsdet_jac(r, lam_val)
+                        elif method == "box-cox":
+                            c = float(torch.clamp(-(r.min()) + 1e-6, min=1e-9).item())
+                            t, _ = _bc_transform_and_logabsdet_jac(r, lam_val, c)
+                        else:
+                            continue
+                            
+                        t = t - t.mean()
+                        var_t = torch.var(t, unbiased=False)
+                        if var_t < best_var:
+                            best_var = var_t
+                            lam_star = lam_val
+                    except:
                         continue
                         
-                    t = t - t.mean()
-                    var_t = torch.var(t, unbiased=False)
-                    if var_t < best_var:
-                        best_var = var_t
-                        lam_star = lam_val
-                except:
-                    continue
-                    
-            if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
-                logger.debug(f"    GRID SEARCH RESULT: lambda={lam_star:.4f}")
+                if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                    logger.debug(f"    GRID SEARCH RESULT: lambda={lam_star:.4f}")
+            
+            # Cache the result
+            if cache_transforms:
+                _feature_transform_cache[cache_key] = (current_moments, lam_star)
         
         # Apply transform and compute bits for this feature
         try:
@@ -507,6 +567,9 @@ def residual_bits_per_feature(
         logger.debug(f"  === Transform Summary ===")
         logger.debug(f"    Features processed: {len(transform_improvements)}")
         logger.debug(f"    Non-identity transforms: {len(successful_transforms)} ({100*len(successful_transforms)/len(transform_improvements):.1f}%)")
+        if cache_transforms:
+            total_cache_attempts = cache_hits + cache_misses
+            logger.debug(f"    Cache: {cache_hits} hits, {cache_misses} misses ({100*cache_hits/total_cache_attempts:.1f}% hit rate)")
         if use_parallel_sa:
             logger.debug(f"    Parallel SA: {sa_successes} successes, {sa_failures} failures")
             if sa_failures > 0:

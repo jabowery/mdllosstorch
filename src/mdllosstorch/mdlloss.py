@@ -14,10 +14,11 @@ class MDLLoss(nn.Module):
                 param_resolution: float = 1e-6,
                 include_transform_param_bits: bool = True,
                 lam_grid: torch.Tensor = None,
-                coder: str = "per_feature",  # Changed default
+                coder: str = "per_feature",
                 use_parallel_sa: bool = False,
                 per_feature_residuals: bool = True,
-                per_layer_parameters: bool = True):
+                per_layer_parameters: bool = True,
+                cache_transforms: bool = True):
         super().__init__()
         self.method = method
         self.data_resolution = float(data_resolution)
@@ -27,6 +28,7 @@ class MDLLoss(nn.Module):
         self.use_parallel_sa = use_parallel_sa
         self.per_feature_residuals = per_feature_residuals
         self.per_layer_parameters = per_layer_parameters
+        self.cache_transforms = cache_transforms
         self._lam_grid = lam_grid
     def forward(self, original: torch.Tensor, reconstructed: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
         residuals = original - reconstructed
@@ -39,6 +41,7 @@ class MDLLoss(nn.Module):
                 method=self.method,
                 data_resolution=self.data_resolution,
                 use_parallel_sa=self.use_parallel_sa,
+                cache_transforms=self.cache_transforms,
             )
         elif self.coder == "gauss_nml":
             res_bits = gauss_nml_bits(
