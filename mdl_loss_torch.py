@@ -34,47 +34,6 @@ class MDLLoss(nn.Module):
     to improve residual compression.
     """
     
-    def __init__(self, 
-                 normalize_method: str = "yeo-johnson",
-                 data_resolution: float = 1e-6,
-                 param_resolution: float = 1e-6,
-                 normalizer_lr: float = 1e-4,
-                 hidden_dim: int = 128,
-                 update_normalizer: bool = True):
-        """
-        Initialize MDL Loss function.
-        
-        Args:
-            normalize_method: "yeo-johnson" or "box-cox"
-            data_resolution: Quantization resolution for data
-            param_resolution: Quantization resolution for parameters
-            normalizer_lr: Learning rate for internal normalizer model
-            hidden_dim: Hidden dimension for normalizer network
-            update_normalizer: Whether to update normalizer during training
-        """
-        super().__init__()
-        
-        self.normalize_method = normalize_method
-        self.data_resolution = data_resolution
-        self.param_resolution = param_resolution
-        self.normalizer_lr = normalizer_lr
-        self.hidden_dim = hidden_dim
-        self.update_normalizer = update_normalizer
-        
-        # Internal state
-        self.normalizer_model = None
-        self.normalizer_optimizer = None
-        self.num_features = None
-        self._initialized = False
-        
-        # Moment loss weights
-        self.moment_weights = {
-            'mean': 1.0, 
-            'variance': 2.0, 
-            'skewness': 1.5, 
-            'kurtosis': 1.0
-        }
-    
     def _initialize_normalizer(self, num_features: int):
         """Initialize the normalizer model for the given feature dimension."""
         if self._initialized and self.num_features == num_features:
@@ -142,6 +101,53 @@ class MDLLoss(nn.Module):
                     total_bits = total_bits + diff_bits + quant_bits
         
         return total_bits
+    def __init__(self, 
+                normalize_method: str = "yeo-johnson",
+                data_resolution: float = 1e-6,
+                param_resolution: float = 1e-6,
+                normalizer_lr: float = 1e-4,
+                hidden_dim: int = 128,
+                update_normalizer: bool = True,
+                debug_logging: bool = False,
+                log_frequency: int = 50):
+        """
+   Initialize MDL Loss function.
+   
+   Args:
+       normalize_method: "yeo-johnson" or "box-cox"
+       data_resolution: Quantization resolution for data
+       param_resolution: Quantization resolution for parameters
+       normalizer_lr: Learning rate for internal normalizer model
+       hidden_dim: Hidden dimension for normalizer network
+       update_normalizer: Whether to update normalizer during training
+       debug_logging: Enable detailed convergence logging
+       log_frequency: Log debug info every N calls
+   """
+        super().__init__()
+        
+        self.normalize_method = normalize_method
+        self.data_resolution = data_resolution
+        self.param_resolution = param_resolution
+        self.normalizer_lr = normalizer_lr
+        self.hidden_dim = hidden_dim
+        self.update_normalizer = update_normalizer
+        self.debug_logging = debug_logging
+        self.log_frequency = log_frequency
+        
+        # Internal state
+        self.normalizer_model = None
+        self.normalizer_optimizer = None
+        self.num_features = None
+        self._initialized = False
+        self._call_count = 0
+        
+        # Moment loss weights
+        self.moment_weights = {
+            'mean': 1.0, 
+            'variance': 2.0, 
+            'skewness': 1.5, 
+            'kurtosis': 1.0
+        }
     def forward(self, x: torch.Tensor, yhat: torch.Tensor, model: nn.Module) -> torch.Tensor:
         """
    Calculate MDL loss in bits.
@@ -154,6 +160,8 @@ class MDLLoss(nn.Module):
    Returns:
        Total MDL loss in bits (scalar tensor)
    """
+        self._call_count += 1
+        
         # Ensure inputs are properly shaped
         if x.dim() > 2:
             x = x.view(x.shape[0], -1)
@@ -184,6 +192,10 @@ class MDLLoss(nn.Module):
         else:
             raise ValueError(f"Unknown normalize method: {self.normalize_method}")
         
+        # Debug logging
+        if self.debug_logging and (self._call_count % self.log_frequency == 0):
+            self._log_convergence_metrics(residuals, normalized_residuals, predicted_lambdas, log_jacobian)
+        
         # Calculate MDL components
         residual_bits = self._calculate_residual_bits(
             residuals, normalized_residuals, log_jacobian
@@ -197,6 +209,97 @@ class MDLLoss(nn.Module):
             self._update_normalizer_separate(residuals.detach())
         
         return total_bits
+    def _log_convergence_metrics(self, residuals: torch.Tensor, normalized_residuals: torch.Tensor, 
+                              predicted_lambdas: torch.Tensor, log_jacobian: torch.Tensor):
+        """Log detailed metrics about normalization convergence."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Calculate moments for original and normalized residuals
+        orig_moments = calculate_statistical_moments(residuals)
+        norm_moments = calculate_statistical_moments(normalized_residuals)
+        
+        # Lambda statistics
+        lambda_mean = predicted_lambdas.mean().item()
+        lambda_std = predicted_lambdas.std().item()
+        lambda_min = predicted_lambdas.min().item()
+        lambda_max = predicted_lambdas.max().item()
+        
+        # Normalization effectiveness metrics
+        orig_mean_abs = orig_moments['mean'].abs().mean().item()
+        norm_mean_abs = norm_moments['mean'].abs().mean().item()
+        
+        orig_var_mean = orig_moments['variance'].mean().item()
+        norm_var_mean = norm_moments['variance'].mean().item()
+        
+        orig_skew_abs = orig_moments['skewness'].abs().mean().item()
+        norm_skew_abs = norm_moments['skewness'].abs().mean().item()
+        
+        orig_kurt_abs = orig_moments['kurtosis'].abs().mean().item()
+        norm_kurt_abs = norm_moments['kurtosis'].abs().mean().item()
+        
+        # Jacobian statistics
+        jacobian_mean = log_jacobian.mean().item()
+        jacobian_std = log_jacobian.std().item()
+        
+        # Compression effectiveness
+        orig_entropy = self._estimate_entropy(residuals)
+        norm_entropy = self._estimate_entropy(normalized_residuals)
+        entropy_reduction = orig_entropy - norm_entropy
+        
+        logger.info(f"\n=== MDL Normalization Debug (Call #{self._call_count}) ===")
+        logger.info(f"Lambda Parameters:")
+        logger.info(f"  Mean: {lambda_mean:.4f}, Std: {lambda_std:.4f}")
+        logger.info(f"  Range: [{lambda_min:.4f}, {lambda_max:.4f}]")
+        
+        logger.info(f"Moment Convergence:")
+        logger.info(f"  Mean |deviation|:  {orig_mean_abs:.6f} → {norm_mean_abs:.6f} ({((norm_mean_abs/orig_mean_abs-1)*100):+.2f}%)")
+        logger.info(f"  Variance:          {orig_var_mean:.6f} → {norm_var_mean:.6f} ({((norm_var_mean-1)*100):+.2f}% from target=1)")
+        logger.info(f"  |Skewness|:        {orig_skew_abs:.6f} → {norm_skew_abs:.6f} ({((norm_skew_abs/orig_skew_abs-1)*100):+.2f}%)")
+        logger.info(f"  |Kurtosis|:        {orig_kurt_abs:.6f} → {norm_kurt_abs:.6f} ({((norm_kurt_abs/orig_kurt_abs-1)*100):+.2f}%)")
+        
+        logger.info(f"Transform Quality:")
+        logger.info(f"  Jacobian: μ={jacobian_mean:.4f}, σ={jacobian_std:.4f}")
+        logger.info(f"  Entropy reduction: {entropy_reduction:.4f} bits/sample")
+        
+        # Gaussianity test (simple normality check)
+        gaussian_score = self._gaussianity_score(normalized_residuals)
+        logger.info(f"  Gaussianity score: {gaussian_score:.4f} (higher = more Gaussian)")
+        
+        # Bit calculation breakdown
+        centered = normalized_residuals - normalized_residuals.mean(dim=0, keepdim=True)
+        variance = centered.var(dim=0, unbiased=False).clamp_min(1e-12)
+        theoretical_bits = 0.5 * torch.log2(2 * 3.14159 * 2.71828 * variance).sum().item()
+        logger.info(f"  Theoretical encoding bits/sample: {theoretical_bits:.2f}")
+        
+        logger.info("=" * 50)
+    def _estimate_entropy(self, x: torch.Tensor, bins: int = 50) -> float:
+        """Estimate differential entropy using histogram method."""
+        x_flat = x.flatten()
+        
+        # Create histogram
+        hist, bin_edges = torch.histogram(x_flat, bins=bins, density=True)
+        bin_width = (bin_edges[1] - bin_edges[0]).item()
+        
+        # Convert to probabilities and calculate entropy
+        probs = hist * bin_width
+        probs = probs[probs > 1e-12]  # Remove zeros
+        
+        entropy = -(probs * torch.log2(probs)).sum().item()
+        return entropy
+    def _gaussianity_score(self, x: torch.Tensor) -> float:
+        """Simple Gaussianity score based on moment deviations from standard normal."""
+        moments = calculate_statistical_moments(x)
+        
+        # Score based on how close moments are to standard normal (0,1,0,0)
+        mean_score = 1.0 / (1.0 + moments['mean'].abs().mean().item())
+        var_score = 1.0 / (1.0 + (moments['variance'] - 1.0).abs().mean().item())  
+        skew_score = 1.0 / (1.0 + moments['skewness'].abs().mean().item())
+        kurt_score = 1.0 / (1.0 + moments['kurtosis'].abs().mean().item())
+        
+        # Weighted average (variance most important for encoding efficiency)
+        total_score = (mean_score + 2*var_score + skew_score + kurt_score) / 5.0
+        return total_score
     def _update_normalizer_separate(self, residuals: torch.Tensor):
         """Update the normalizer model in a separate forward pass to avoid graph conflicts."""
         # Fresh forward pass for normalizer with gradients enabled
@@ -217,6 +320,12 @@ class MDLLoss(nn.Module):
         moment_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.normalizer_model.parameters(), max_norm=1.0)
         self.normalizer_optimizer.step()
+        
+        # Log normalizer training progress
+        if self.debug_logging and (self._call_count % self.log_frequency == 0):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Normalizer Update - Moment Loss: {moment_loss.item():.6f}")
 
 
 class NormalizerModel(nn.Module):
@@ -410,6 +519,42 @@ def moment_distance_loss(current_moments: Dict[str, torch.Tensor],
             total_loss = total_loss + weight * error
     
     return total_loss
+if __name__ == "__main__":
+    # Set up logging for debug output
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s: %(message)s'
+    )
+    
+    # Example with the exact interface you requested
+    import torch
+    
+    model = torch.nn.Linear(10, 10)
+    x = torch.randn(32, 10)
+    yhat = model(x)
+    
+    # Enable debug logging
+    loss_fn = MDLLoss(debug_logging=True, log_frequency=1)
+    bits = loss_fn(x, yhat, model)
+    print("Total MDL (bits):", bits.item())
+    
+    # Example with training loop
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    
+    print("\n" + "="*60)
+    print("TRAINING WITH DEBUG LOGGING")
+    print("="*60)
+    
+    for epoch in range(10):
+        yhat = model(x)
+        mdl_loss = loss_fn(x, yhat, model)
+        
+        optimizer.zero_grad()
+        mdl_loss.backward()
+        optimizer.step()
+        
+        print(f"Epoch {epoch}: MDL = {mdl_loss.item():.2f} bits")
 
 
 # Example usage
