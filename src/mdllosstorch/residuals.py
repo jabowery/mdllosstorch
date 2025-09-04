@@ -336,10 +336,13 @@ def residual_bits_per_feature(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"=== Per-Feature Residual Analysis ===")
         logger.debug(f"  Processing {n_features} features with {n_samples} samples each")
+        logger.debug(f"  Parallel SA enabled: {use_parallel_sa}")
         log_tensor_moments(residuals, "All residuals")
     
     # Track statistics for reporting
     transform_improvements = []
+    sa_successes = 0
+    sa_failures = 0
     
     for feat_idx in range(n_features):
         r = residuals[:, feat_idx]
@@ -367,18 +370,32 @@ def residual_bits_per_feature(
             log_tensor_moments(r, f"Feature {feat_idx} before transform")
             
         # Find optimal transform for this feature
+        transform_method_used = "unknown"
         if use_parallel_sa:
             from .parallel_sa import MDLParallelHyperparameterSearch
             sa_search = MDLParallelHyperparameterSearch(memory_limit_mb=500)
             try:
                 lam_star = sa_search.search_lambda_params(r, method, data_resolution)
-            except:
+                sa_successes += 1
+                transform_method_used = "parallel_sa"
+                if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                    logger.debug(f"    PARALLEL SA SUCCESS: lambda={lam_star:.4f}")
+            except Exception as e:
+                sa_failures += 1
                 lam_star = 0.0
+                transform_method_used = f"parallel_sa_failed_{type(e).__name__}"
+                if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                    logger.debug(f"    PARALLEL SA FAILED: {e}")
+                    logger.debug(f"    Falling back to identity transform (lambda=0.0)")
         else:
             # Grid search for this feature
+            transform_method_used = "grid_search"
             lam_grid = torch.linspace(-2.0, 2.0, 21, device=r.device, dtype=r.dtype)
             best_var = float('inf')
             lam_star = 0.0
+            
+            if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                logger.debug(f"    GRID SEARCH: Testing {len(lam_grid)} lambda values")
             
             for lam in lam_grid:
                 lam_val = float(lam.item())
@@ -398,6 +415,9 @@ def residual_bits_per_feature(
                         lam_star = lam_val
                 except:
                     continue
+                    
+            if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                logger.debug(f"    GRID SEARCH RESULT: lambda={lam_star:.4f}")
         
         # Apply transform and compute bits for this feature
         try:
@@ -422,12 +442,14 @@ def residual_bits_per_feature(
                 'lambda': lam_star,
                 'var_before': r_original_var,
                 'var_after': var_t.item(),
-                'var_reduction_pct': var_reduction_pct
+                'var_reduction_pct': var_reduction_pct,
+                'method': transform_method_used
             })
             
             # Detailed logging for selected features
             if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
                 log_tensor_moments(t, f"Feature {feat_idx} after transform")
+                logger.debug(f"    Method used: {transform_method_used}")
                 logger.debug(f"    Lambda: {lam_star:.4f}")
                 logger.debug(f"    Variance: {r_original_var:.6f} → {var_t.item():.6f} ({var_reduction_pct:+.1f}%)")
                 if r_original_skew is not None:
@@ -455,7 +477,7 @@ def residual_bits_per_feature(
             
             # Regular progress logging
             if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 10) == 0:
-                logger.debug(f"    Feature {feat_idx}: lambda={lam_star:.3f}, var_reduction={var_reduction_pct:+.1f}%, bits={feature_bits:.1f}")
+                logger.debug(f"    Feature {feat_idx}: lambda={lam_star:.3f}, var_reduction={var_reduction_pct:+.1f}%, bits={feature_bits:.1f} ({transform_method_used})")
                 
         except Exception as e:
             # Fallback to identity for problematic features
@@ -473,7 +495,8 @@ def residual_bits_per_feature(
                 'lambda': 0.0,
                 'var_before': r_original_var,
                 'var_after': r_original_var,
-                'var_reduction_pct': 0.0
+                'var_reduction_pct': 0.0,
+                'method': 'failed'
             })
     
     # Summary statistics
@@ -484,6 +507,10 @@ def residual_bits_per_feature(
         logger.debug(f"  === Transform Summary ===")
         logger.debug(f"    Features processed: {len(transform_improvements)}")
         logger.debug(f"    Non-identity transforms: {len(successful_transforms)} ({100*len(successful_transforms)/len(transform_improvements):.1f}%)")
+        if use_parallel_sa:
+            logger.debug(f"    Parallel SA: {sa_successes} successes, {sa_failures} failures")
+            if sa_failures > 0:
+                logger.debug(f"    WARNING: {100*sa_failures/(sa_successes+sa_failures):.1f}% of SA attempts failed")
         if var_reductions:
             import statistics
             logger.debug(f"    Variance reduction: mean={statistics.mean(var_reductions):.1f}%, median={statistics.median(var_reductions):.1f}%")
