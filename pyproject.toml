@@ -15,7 +15,8 @@ authors = [
 
 # Runtime dependencies (minimal, permissive)
 dependencies = [
-    "torch>=1.12"
+    "torch>=1.12",
+    "numpy"
 ]
 
 [project.optional-dependencies]
