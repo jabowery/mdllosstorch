@@ -336,24 +336,66 @@ def _get_feature_moments(tensor: torch.Tensor) -> tuple:
         
         return (mean_val, var_val, skew, kurt)
 def _moments_changed_significantly(old_moments: tuple, new_moments: tuple, 
-                                 rel_tol: float = 0.1, abs_tol: float = 0.01) -> bool:
-    """Check if moments have changed enough to invalidate cached transform."""
-    for old, new in zip(old_moments, new_moments):
+                                 rel_tol: float = 0.1, abs_tol: float = 0.01) -> tuple:
+    """Check if moments have changed enough to invalidate cached transform.
+    Returns (changed: bool, change_magnitude: float, change_type: str)
+    """
+    max_rel_change = 0.0
+    change_type = "none"
+    
+    moment_names = ["mean", "variance", "skewness", "kurtosis"]
+    
+    for i, (old, new) in enumerate(zip(old_moments, new_moments)):
         # Skip comparison if both are very small
         if abs(old) < abs_tol and abs(new) < abs_tol:
             continue
             
-        # Relative change check
+        # Calculate relative change
         if abs(old) > abs_tol:
             rel_change = abs(new - old) / abs(old)
-            if rel_change > rel_tol:
-                return True
+            if rel_change > max_rel_change:
+                max_rel_change = rel_change
+                change_type = moment_names[i]
         else:
             # Absolute change for small values
-            if abs(new - old) > abs_tol:
-                return True
-                
-    return False
+            abs_change = abs(new - old)
+            if abs_change > abs_tol:
+                rel_change = abs_change / abs_tol  # Normalize to relative scale
+                if rel_change > max_rel_change:
+                    max_rel_change = rel_change
+                    change_type = moment_names[i]
+    
+    changed = max_rel_change > rel_tol
+    return changed, max_rel_change, change_type
+def _estimate_search_range(old_lambda: float, change_magnitude: float, change_type: str) -> tuple:
+    """Estimate focused search range based on moment changes."""
+    
+    # Base search width depends on change magnitude
+    base_width = min(0.5, change_magnitude * 2.0)  # Cap at 0.5 units
+    
+    # Adjust based on which moment changed most
+    if change_type == "skewness":
+        # Skewness changes often need larger lambda adjustments
+        width = base_width * 1.5
+        # Direction hint: increasing skewness often needs more negative lambda
+    elif change_type == "kurtosis":
+        # Kurtosis changes can be addressed with moderate lambda changes
+        width = base_width * 1.2
+    elif change_type == "variance":
+        # Variance changes might need smaller, more precise adjustments
+        width = base_width * 0.8
+    else:
+        # Mean changes usually don't affect optimal lambda much
+        width = base_width * 0.6
+    
+    # Ensure minimum search range
+    width = max(width, 0.1)
+    
+    # Calculate search bounds
+    lambda_min = max(-2.0, old_lambda - width)
+    lambda_max = min(2.0, old_lambda + width)
+    
+    return lambda_min, lambda_max
 def residual_bits_per_feature(
     residuals: torch.Tensor,
     method: str = "yeo-johnson", 
@@ -383,6 +425,8 @@ def residual_bits_per_feature(
     sa_failures = 0
     cache_hits = 0
     cache_misses = 0
+    focused_searches = 0
+    full_searches = 0
     
     for feat_idx in range(n_features):
         r = residuals[:, feat_idx]
@@ -397,19 +441,30 @@ def residual_bits_per_feature(
         
         # Check cache
         use_cached_transform = False
+        use_focused_search = False
+        old_lambda = 0.0
         lam_star = 0.0
         
         if cache_transforms and cache_key in _feature_transform_cache:
             cached_moments, cached_lambda = _feature_transform_cache[cache_key]
-            if not _moments_changed_significantly(cached_moments, current_moments):
+            changed, change_magnitude, change_type = _moments_changed_significantly(cached_moments, current_moments)
+            
+            if not changed:
                 lam_star = cached_lambda
                 use_cached_transform = True
                 cache_hits += 1
                 transform_method_used = "cached"
             else:
                 cache_misses += 1
+                old_lambda = cached_lambda
+                if change_magnitude < 0.3:  # Moderate change - use focused search
+                    use_focused_search = True
+                    focused_searches += 1
+                else:
+                    full_searches += 1
         else:
             cache_misses += 1
+            full_searches += 1
             
         # Log original feature statistics for detailed features
         r_original_var = current_moments[1]  # variance
@@ -424,10 +479,13 @@ def residual_bits_per_feature(
             log_tensor_moments(r, f"Feature {feat_idx} before transform")
             if use_cached_transform:
                 logger.debug(f"    CACHE HIT: Using cached lambda={lam_star:.4f}")
+            elif use_focused_search:
+                logger.debug(f"    CACHE MISS: Using focused search around lambda={old_lambda:.4f}")
             
         # Find optimal transform if not cached
         if not use_cached_transform:
-            if use_parallel_sa:
+            if use_parallel_sa and not use_focused_search:
+                # Only use parallel SA for full searches
                 from .parallel_sa import MDLParallelHyperparameterSearch
                 sa_search = MDLParallelHyperparameterSearch(memory_limit_mb=500)
                 try:
@@ -444,14 +502,23 @@ def residual_bits_per_feature(
                         logger.debug(f"    PARALLEL SA FAILED: {e}")
                         logger.debug(f"    Falling back to identity transform (lambda=0.0)")
             else:
-                # Grid search for this feature
-                transform_method_used = "grid_search"
-                lam_grid = torch.linspace(-2.0, 2.0, 11, device=r.device, dtype=r.dtype)  # Reduced from 21 to 11
-                best_var = float('inf')
-                lam_star = 0.0
+                # Grid search for this feature (focused or full)
+                if use_focused_search:
+                    # Focused search around previous lambda
+                    lambda_min, lambda_max = _estimate_search_range(old_lambda, change_magnitude, change_type)
+                    lam_grid = torch.linspace(lambda_min, lambda_max, 7, device=r.device, dtype=r.dtype)
+                    transform_method_used = "focused_search"
+                    if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                        logger.debug(f"    FOCUSED SEARCH: Range [{lambda_min:.3f}, {lambda_max:.3f}], {len(lam_grid)} points")
+                else:
+                    # Full search
+                    lam_grid = torch.linspace(-2.0, 2.0, 11, device=r.device, dtype=r.dtype)
+                    transform_method_used = "grid_search"
+                    if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
+                        logger.debug(f"    FULL GRID SEARCH: Testing {len(lam_grid)} lambda values")
                 
-                if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
-                    logger.debug(f"    GRID SEARCH: Testing {len(lam_grid)} lambda values")
+                best_var = float('inf')
+                lam_star = old_lambda if use_focused_search else 0.0  # Default to previous lambda if focused
                 
                 for lam in lam_grid:
                     lam_val = float(lam.item())
@@ -473,7 +540,8 @@ def residual_bits_per_feature(
                         continue
                         
                 if logger.isEnabledFor(logging.DEBUG) and feat_idx % max(1, n_features // 20) == 0:
-                    logger.debug(f"    GRID SEARCH RESULT: lambda={lam_star:.4f}")
+                    search_type = "FOCUSED" if use_focused_search else "FULL"
+                    logger.debug(f"    {search_type} SEARCH RESULT: lambda={lam_star:.4f}")
             
             # Cache the result
             if cache_transforms:
@@ -570,6 +638,8 @@ def residual_bits_per_feature(
         if cache_transforms:
             total_cache_attempts = cache_hits + cache_misses
             logger.debug(f"    Cache: {cache_hits} hits, {cache_misses} misses ({100*cache_hits/total_cache_attempts:.1f}% hit rate)")
+            if cache_misses > 0:
+                logger.debug(f"    Search strategy: {focused_searches} focused, {full_searches} full searches")
         if use_parallel_sa:
             logger.debug(f"    Parallel SA: {sa_successes} successes, {sa_failures} failures")
             if sa_failures > 0:
