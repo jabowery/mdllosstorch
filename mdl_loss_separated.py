@@ -177,33 +177,6 @@ class NormalizerTrainer:
                 raise ValueError(f"Unknown normalize method: {self.normalize_method}")
         
         return normalize_fn
-    def update(self, residuals: torch.Tensor) -> float:
-        """
-   Update lambda parameters using gradient in 4D moment space.
-   
-   Args:
-       residuals: Current residuals to normalize
-       
-   Returns:
-       Moment loss value
-   """
-        # Apply normalization with current lambdas (gradients enabled)
-        if self.normalize_method == "yeo-johnson":
-            normalized_residuals, _ = yeo_johnson_normalize(residuals.detach(), self.lambdas)
-        else:
-            normalized_residuals, _ = box_cox_normalize(residuals.detach(), self.lambdas)
-        
-        # Calculate moment loss in 4D space
-        current_moments = calculate_statistical_moments(normalized_residuals)
-        moment_loss = moment_distance_loss(current_moments, weights=self.moment_weights)
-        
-        # Update lambda parameters directly
-        self.optimizer.zero_grad()
-        moment_loss.backward()
-        torch.nn.utils.clip_grad_norm_([self.lambdas], max_norm=1.0)
-        self.optimizer.step()
-        
-        return moment_loss.item()
     def get_stats(self, residuals: torch.Tensor) -> Dict[str, float]:
         """Get normalization effectiveness statistics."""
         with torch.no_grad():
@@ -227,6 +200,38 @@ class NormalizerTrainer:
                 'orig_skew_abs': orig_moments['skewness'].abs().mean().item(),
                 'norm_skew_abs': norm_moments['skewness'].abs().mean().item(),
             }
+    def update(self, residuals: torch.Tensor, regularization_weight: float = 1e-4) -> float:
+        """
+   Update lambda parameters using moment loss + L2 regularization.
+   
+   Args:
+       residuals: Current residuals to normalize
+       regularization_weight: L2 penalty weight for lambda parameters
+       
+   Returns:
+       Combined loss value (moment + L2)
+   """
+        # Apply normalization with current lambdas (gradients enabled)
+        if self.normalize_method == "yeo-johnson":
+            normalized_residuals, _ = yeo_johnson_normalize(residuals.detach(), self.lambdas)
+        else:
+            normalized_residuals, _ = box_cox_normalize(residuals.detach(), self.lambdas)
+        
+        # Calculate moment loss in 4D space
+        current_moments = calculate_statistical_moments(normalized_residuals)
+        moment_loss = moment_distance_loss(current_moments, weights=self.moment_weights)
+        
+        # Add L2 regularization to prevent lambda parameters from growing too large
+        l2_penalty = regularization_weight * torch.norm(self.lambdas)**2
+        total_loss = moment_loss + l2_penalty
+        
+        # Update lambda parameters
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_([self.lambdas], max_norm=1.0)
+        self.optimizer.step()
+        
+        return total_loss.item()
 
 
 def yeo_johnson_normalize(x: torch.Tensor, lam: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

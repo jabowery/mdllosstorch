@@ -14,10 +14,12 @@ import torch.nn as nn
 import logging
 from typing import Dict, Tuple, Optional
 import numpy as np
+import math
 
 # Import our separated MDL components
 from mdl_loss_separated import (
-    MDLLoss, NormalizerTrainer, NormalizerModel,
+    MDLLoss, 
+    NormalizerTrainer, 
     calculate_statistical_moments, moment_distance_loss
 )
 
@@ -93,39 +95,6 @@ class RecursiveMDLTrainer:
         )
         
         return train_loader, val_loader
-    
-    def train_normalizer_with_mdl(self, residuals: torch.Tensor, 
-                                  max_updates: int = 10) -> Tuple[float, int]:
-        """
-        Train normalizer using MDL principle to prevent overfitting.
-        
-        Returns:
-            (final_moment_loss, num_updates_performed)
-        """
-        best_normalizer_mdl = float('inf')
-        no_improvement_count = 0
-        
-        for update_idx in range(max_updates):
-            # Standard moment-based update
-            moment_loss = self.normalizer_trainer.update(residuals)
-            
-            # Evaluate normalizer's own MDL cost
-            normalizer_mdl = self.evaluate_normalizer_mdl(residuals)
-            
-            # Early stopping based on MDL
-            if normalizer_mdl < best_normalizer_mdl:
-                best_normalizer_mdl = normalizer_mdl
-                no_improvement_count = 0
-            else:
-                no_improvement_count += 1
-                
-                # Stop if normalizer MDL isn't improving (overfitting protection)
-                if no_improvement_count >= 3:
-                    logger.debug(f"Stopping normalizer updates at {update_idx + 1} "
-                               f"due to MDL plateau")
-                    break
-        
-        return moment_loss, update_idx + 1
     
     def validate_models(self, val_loader) -> Tuple[float, float]:
         """Validate both main model and normalizer on held-out data."""
@@ -268,27 +237,55 @@ class RecursiveMDLTrainer:
         return self.training_history
     def evaluate_normalizer_mdl(self, residuals: torch.Tensor) -> float:
         """
-   Calculate MDL cost of lambda parameters directly.
-   Now we have exactly num_features parameters instead of a neural network.
+   Bottom out recursion with L2 regularization instead of full MDL.
+   This breaks the infinite recursion by using traditional regularization.
    """
-        # Simple parameter encoding for lambda values
-        num_params = self.normalizer_trainer.lambdas.numel()  # Should be num_features
+        # L2 regularization on lambda parameters (traditional approach)
+        l2_penalty = torch.norm(self.normalizer_trainer.lambdas)**2
         
-        # Calculate parameter bits assuming reasonable precision
-        param_variance = self.normalizer_trainer.lambdas.var(unbiased=False).clamp_min(1e-12)
+        # Scale the penalty appropriately 
+        regularization_weight = 1e-4
+        normalizer_cost = regularization_weight * l2_penalty
         
-        # Differential entropy + quantization for lambda parameters
-        diff_bits = num_params * (0.5 * math.log2(2 * math.pi * math.e) + 
-                                 0.5 * torch.log2(param_variance))
-        quant_bits = num_params * math.log2(1.0 / 1e-6)  # Parameter resolution
+        return normalizer_cost.item()
+    def train_normalizer_with_mdl(self, residuals: torch.Tensor, 
+                                 max_updates: int = 10) -> Tuple[float, int]:
+        """
+   Train normalizer using moment loss + L2 regularization (bottom out recursion).
+   
+   Returns:
+       (final_moment_loss, num_updates_performed)
+   """
+        best_combined_loss = float('inf')
+        no_improvement_count = 0
+        regularization_weight = 1e-4
         
-        total_normalizer_mdl = diff_bits + quant_bits
+        for update_idx in range(max_updates):
+            # Standard moment-based update
+            moment_loss = self.normalizer_trainer.update(residuals)
+            
+            # Add L2 regularization instead of recursive MDL
+            l2_penalty = torch.norm(self.normalizer_trainer.lambdas)**2
+            combined_loss = moment_loss + regularization_weight * l2_penalty.item()
+            
+            # Early stopping based on combined loss
+            if combined_loss < best_combined_loss:
+                best_combined_loss = combined_loss
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+                
+                # Stop if combined loss isn't improving
+                if no_improvement_count >= 3:
+                    logger.debug(f"Stopping normalizer updates at {update_idx + 1} "
+                               f"due to combined loss plateau")
+                    break
         
-        return total_normalizer_mdl.item()
+        return moment_loss, update_idx + 1
     def _estimate_optimal_lambdas(self, residuals: torch.Tensor) -> torch.Tensor:
         """
-   This method is no longer needed since we optimize lambdas directly.
-   Return current lambda values as placeholder.
+   No longer needed with L2 regularization approach.
+   Return current lambda values.
    """
         return self.normalizer_trainer.lambdas.detach()
 
