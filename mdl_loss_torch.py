@@ -524,6 +524,176 @@ if __name__ == "__main__":
     import logging
     logging.basicConfig(
         level=logging.INFO,
+        format='%(levelname)s:%(name)s:%(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    # Create realistic dataset matching original example
+    torch.manual_seed(42)
+    
+    # Generate more complex, realistic data (like MNIST flattened)
+    num_samples = 1000
+    num_features = 784
+    
+    # Create data with various distributions to make normalization meaningful
+    dummy_data = torch.cat([
+        torch.randn(num_samples // 4, num_features // 4) * 0.5,  # Normal
+        torch.exponential(torch.ones(num_samples // 4, num_features // 4) * 2.0),  # Exponential (skewed)
+        torch.uniform(torch.zeros(num_samples // 4, num_features // 4), 
+                     torch.ones(num_samples // 4, num_features // 4) * 10),  # Uniform
+        torch.randn(num_samples // 4, num_features // 4).pow(2)  # Chi-squared-like
+    ], dim=1)
+    
+    # Add some structure/correlation to make reconstruction meaningful
+    noise = torch.randn(num_samples, num_features) * 0.1
+    dummy_data = dummy_data + noise
+    
+    print(f"Dataset shape: {dummy_data.shape}")
+    print(f"Data range: [{dummy_data.min().item():.3f}, {dummy_data.max().item():.3f}]")
+    print(f"Data mean: {dummy_data.mean().item():.3f}, std: {dummy_data.std().item():.3f}")
+    
+    # Create DataLoader for batch training
+    dataset = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(dummy_data), 
+        batch_size=64, 
+        shuffle=True
+    )
+    
+    # Create autoencoder model (matching original architecture)
+    input_dim = num_features
+    model = torch.nn.Sequential(
+        torch.nn.Linear(input_dim, 128),
+        torch.nn.ReLU(),
+        torch.nn.Dropout(0.1),
+        torch.nn.Linear(128, 64),
+        torch.nn.ReLU(),
+        torch.nn.Linear(64, 32),
+        torch.nn.ReLU(),
+        # Decoder
+        torch.nn.Linear(32, 64),
+        torch.nn.ReLU(),
+        torch.nn.Dropout(0.1),
+        torch.nn.Linear(64, 128),
+        torch.nn.ReLU(),
+        torch.nn.Linear(128, input_dim)
+    )
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
+    
+    # Initialize MDL loss with debug logging
+    loss_fn = MDLLoss(
+        debug_logging=True, 
+        log_frequency=100,  # Log every 100 batches
+        normalize_method="yeo-johnson"
+    )
+    
+    # Optimizer for main model
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    
+    print("\n" + "="*60)
+    print("TRAINING WITH DUAL-MODEL CONVERGENCE")
+    print("="*60)
+    
+    num_epochs = 10
+    
+    for epoch in range(num_epochs):
+        epoch_mdl_loss = 0.0
+        epoch_moment_loss = 0.0
+        num_batches = 0
+        
+        model.train()
+        loss_fn.train()
+        
+        for batch_idx, (batch_data,) in enumerate(dataset):
+            # Ensure proper shape
+            if batch_data.dim() > 2:
+                batch_data = batch_data.view(batch_data.shape[0], -1)
+            
+            # Forward pass
+            yhat = model(batch_data)
+            mdl_loss = loss_fn(batch_data, yhat, model)
+            
+            # Get moment loss for logging (separate computation)
+            with torch.no_grad():
+                residuals = batch_data - yhat
+                if hasattr(loss_fn, 'normalizer_model') and loss_fn.normalizer_model is not None:
+                    pred_lambdas = loss_fn.normalizer_model(residuals)
+                    if loss_fn.normalize_method == "yeo-johnson":
+                        norm_residuals, _ = yeo_johnson_normalize(residuals, pred_lambdas)
+                    else:
+                        norm_residuals, _ = box_cox_normalize(residuals, pred_lambdas)
+                    current_moments = calculate_statistical_moments(norm_residuals)
+                    moment_loss = moment_distance_loss(current_moments, weights=loss_fn.moment_weights)
+                    epoch_moment_loss += moment_loss.item()
+                else:
+                    epoch_moment_loss += 0.0
+            
+            # Backward pass for main model
+            optimizer.zero_grad()
+            mdl_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            epoch_mdl_loss += mdl_loss.item()
+            num_batches += 1
+            
+            # Log batch progress
+            if batch_idx % 100 == 0:
+                moment_val = moment_loss.item() if 'moment_loss' in locals() else 0.0
+                logger.info(f"Epoch {epoch}, Batch {batch_idx}: "
+                          f"MDL Loss = {mdl_loss.item():.2f}, "
+                          f"Moment Loss = {moment_val:.4f}")
+        
+        # Epoch summary
+        avg_mdl = epoch_mdl_loss / num_batches
+        avg_moment = epoch_moment_loss / num_batches
+        logger.info(f"Epoch {epoch}: Avg MDL Loss = {avg_mdl:.2f}, "
+                   f"Avg Moment Loss = {avg_moment:.4f}")
+        
+        print(f"Epoch {epoch}: MDL = {avg_mdl:.2f} bits, Moment = {avg_moment:.4f}")
+    
+    logger.info("Training completed successfully!")
+    
+    print("\n" + "="*60)
+    print("FINAL CONVERGENCE ANALYSIS")
+    print("="*60)
+    
+    # Final analysis
+    model.eval()
+    loss_fn.eval()
+    
+    with torch.no_grad():
+        # Test on first batch
+        test_batch = next(iter(dataset))[0]
+        if test_batch.dim() > 2:
+            test_batch = test_batch.view(test_batch.shape[0], -1)
+        
+        yhat_final = model(test_batch)
+        final_loss = loss_fn(test_batch, yhat_final, model)
+        
+        print(f"Final MDL Loss: {final_loss.item():.2f} bits")
+        
+        # Show normalization effectiveness
+        residuals = test_batch - yhat_final
+        original_moments = calculate_statistical_moments(residuals)
+        
+        if hasattr(loss_fn, 'normalizer_model') and loss_fn.normalizer_model is not None:
+            pred_lambdas = loss_fn.normalizer_model(residuals)
+            norm_residuals, _ = yeo_johnson_normalize(residuals, pred_lambdas)
+            normalized_moments = calculate_statistical_moments(norm_residuals)
+            
+            print(f"\nNormalization Effectiveness:")
+            print(f"Original  - Mean: {original_moments['mean'].abs().mean():.4f}, "
+                  f"Var: {original_moments['variance'].mean():.4f}, "
+                  f"Skew: {original_moments['skewness'].abs().mean():.4f}")
+            print(f"Normalized- Mean: {normalized_moments['mean'].abs().mean():.4f}, "
+                  f"Var: {normalized_moments['variance'].mean():.4f}, "
+                  f"Skew: {normalized_moments['skewness'].abs().mean():.4f}")
+if __name__ == "__main__":
+    # Set up logging for debug output
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
         format='%(levelname)s: %(message)s'
     )
     
