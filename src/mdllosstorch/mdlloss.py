@@ -1,167 +1,247 @@
+# mdllosstorch.py
+import math
+from typing import Dict, Optional, Tuple
+
 import torch
-from torch import nn
-from .residuals import residual_bits_transformed_gradsafe, gauss_nml_bits
-from .parameters import parameter_bits_model_student_t
+import torch.nn as nn
+
+
+def _calc_moments(x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    # x: [B, F]
+    mean = x.mean(dim=0)
+    centered = x - mean
+    var = centered.pow(2).mean(dim=0).clamp_min(1e-12)
+    std = var.sqrt()
+    z = centered / std
+    skew = z.pow(3).mean(dim=0)
+    kurt = z.pow(4).mean(dim=0) - 3.0
+    return {"mean": mean, "var": var, "skew": skew, "kurt": kurt}
+
+
+def _moment_distance(
+    cur: Dict[str, torch.Tensor],
+    tgt: Optional[Dict[str, torch.Tensor]] = None,
+    w: Optional[Dict[str, float]] = None,
+) -> torch.Tensor:
+    if tgt is None:
+        tgt = {
+            "mean": torch.zeros_like(cur["mean"]),
+            "var": torch.ones_like(cur["var"]),
+            "skew": torch.zeros_like(cur["skew"]),
+            "kurt": torch.zeros_like(cur["kurt"]),
+        }
+    if w is None:
+        w = {"mean": 1.0, "var": 2.0, "skew": 1.5, "kurt": 1.0}
+
+    loss = torch.tensor(0.0, device=cur["mean"].device)
+    # var: compare in log-space to be scale-aware
+    loss = loss + w["var"] * (torch.log(cur["var"]) - torch.log(tgt["var"])).pow(2).mean()
+    loss = loss + w["mean"] * (cur["mean"] - tgt["mean"]).pow(2).mean()
+    loss = loss + w["skew"] * (cur["skew"] - tgt["skew"]).pow(2).mean()
+    loss = loss + w["kurt"] * (cur["kurt"] - tgt["kurt"]).pow(2).mean()
+    return loss
+
+
+def yeo_johnson(x: torch.Tensor, lam: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Differentiable Yeo–Johnson transform and log|Jacobian| without in-place masked writes.
+
+    x:   [B, F]
+    lam: [F] or [B, F]
+    returns: (y, log_jacobian_per_sample=[B])
+    """
+    if lam.dim() == 1:
+        lam = lam.unsqueeze(0).expand_as(x)  # [B, F]
+
+    pos = x >= 0
+    neg = ~pos
+
+    eps = 1e-8
+
+    # Positive branch
+    # y = ((x+1)^lam - 1)/lam ; special-case lam≈0 -> log1p(x)
+    ap = x + 1.0
+    y_pos_general = ((ap).pow(lam) - 1.0) / lam
+    y_pos_l0 = torch.log1p(x)
+    y_pos = torch.where(torch.abs(lam) < eps, y_pos_l0, y_pos_general)
+
+    # Negative branch
+    # y = -(((1-x)^(2-lam) - 1)/(2-lam)) ; special-case (2-lam)≈0 -> -log1p(-x)
+    an = 1.0 - x
+    l2 = 2.0 - lam
+    y_neg_general = -((an).pow(l2) - 1.0) / l2
+    y_neg_l0 = -torch.log1p(-x)
+    y_neg = torch.where(torch.abs(l2) < eps, y_neg_l0, y_neg_general)
+
+    # Select by sign of x
+    y = torch.where(pos, y_pos, y_neg)
+
+    # log|Jacobian|
+    # pos:  (lam-1)*log1p(x)
+    # neg:  (1-lam)*log1p(-x)
+    lj_pos = (lam - 1.0) * torch.log1p(x.clamp_min(0))  # clamp_min avoids log(<=0) numerics
+    lj_neg = (1.0 - lam) * torch.log1p((-x).clamp_min(0))
+    lj = torch.where(pos, lj_pos, lj_neg)
+
+    log_jacobian = lj.sum(dim=1)  # [B]
+    return y, log_jacobian
+
+
+class _Normalizer(nn.Module):
+    """
+    Predicts per-feature lambda in [-2, 2] from residual moments.
+    Stateful and trained inside MDLLoss via a proxy moment loss.
+    """
+
+    def __init__(self, num_features: int, hidden: int = 128):
+        super().__init__()
+        self.num_features = num_features
+        in_dim = num_features * 4  # mean, std, skew, kurt
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, num_features),
+            nn.Tanh(),
+        )
+
+    def forward(self, residuals: torch.Tensor) -> torch.Tensor:
+        # residuals: [B, F]
+        m = _calc_moments(residuals)
+        std = m["var"].sqrt().clamp_min(1e-8)
+        feats = torch.stack([m["mean"], std, m["skew"], m["kurt"]], dim=0).reshape(-1)  # [4F]
+        x = feats.unsqueeze(0)  # [1, 4F]
+        lam = self.net(x).squeeze(0) * 2.0  # [-2, 2], shape [F]
+        return lam
+
+
+def _gaussian_bits(centered: torch.Tensor) -> torch.Tensor:
+    # centered: [B, F], variance per feature
+    var = centered.var(dim=0, unbiased=False).clamp_min(1e-12)
+    diff_bits_per_sample = 0.5 * math.log2(2 * math.pi * math.e) + 0.5 * torch.log2(var)
+    return centered.size(0) * diff_bits_per_sample.sum()
+
+
+def _quant_bits(n_entries: int, resolution: float) -> float:
+    return n_entries * math.log2(1.0 / resolution)
+
+
+def _param_bits(model: nn.Module, param_resolution: float) -> torch.Tensor:
+    device = (
+        next(model.parameters()).device
+        if any(p.requires_grad for p in model.parameters())
+        else torch.device("cpu")
+    )
+    total = torch.tensor(0.0, device=device)
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        flat = p.reshape(-1)
+        if flat.numel() == 0:
+            continue
+        var = flat.var(unbiased=False).clamp_min(1e-12)
+        diff = flat.numel() * (0.5 * math.log2(2 * math.pi * math.e) + 0.5 * torch.log2(var))
+        quant = _quant_bits(flat.numel(), param_resolution)
+        total = total + diff + quant
+    return total
 
 
 class MDLLoss(nn.Module):
-    """Total MDL loss in bits:
-    L = residual_bits (Yeo-Johnson/Box-Cox + Jacobian + discretization)
-      + parameter_bits (Student-t with discretization)
     """
-    def __init__(self, method: str = "yeo-johnson",
-                data_resolution: float = 1e-6,
-                param_resolution: float = 1e-6,
-                include_transform_param_bits: bool = True,
-                lam_grid: torch.Tensor = None,
-                coder: str = "per_feature",
-                use_parallel_sa: bool = False,
-                per_feature_residuals: bool = True,
-                per_layer_parameters: bool = True,
-                cache_transforms: bool = True):
+    Callable MDL loss with an internal, stateful normalizer model.
+
+    Usage:
+        loss_fn = MDLLoss()
+        bits = loss_fn(x, yhat, model)
+
+    Behavior:
+      • Computes residual bits using Yeo–Johnson (λ predicted by internal normalizer).
+      • Adds parameter bits for `model`.
+      • Trains the internal normalizer in-place each call via a lightweight
+        moment-matching proxy objective (no gradients flow into `model` from this step).
+    """
+
+    def __init__(
+        self,
+        data_resolution: float = 1e-6,
+        param_resolution: float = 1e-6,
+        normalizer_hidden: int = 128,
+        normalizer_lr: float = 1e-3,
+        train_normalizer_steps: int = 1,
+        device: Optional[torch.device] = None,
+    ):
         super().__init__()
-        self.method = method
-        self.data_resolution = float(data_resolution)
-        self.param_resolution = float(param_resolution)
-        self.coder = coder
-        self.include_transform_param_bits = include_transform_param_bits
-        self.use_parallel_sa = use_parallel_sa
-        self.per_feature_residuals = per_feature_residuals
-        self.per_layer_parameters = per_layer_parameters
-        self.cache_transforms = cache_transforms
-        self._lam_grid = lam_grid
-    def forward(self, original: torch.Tensor, reconstructed: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
-        residuals = original - reconstructed
-        
-        # Choose residual encoding method
-        if self.per_feature_residuals:
-            from .residuals import residual_bits_per_feature
-            res_bits = residual_bits_per_feature(
-                residuals,
-                method=self.method,
-                data_resolution=self.data_resolution,
-                use_parallel_sa=self.use_parallel_sa,
-                cache_transforms=self.cache_transforms,
-            )
-        elif self.coder == "gauss_nml":
-            res_bits = gauss_nml_bits(
-                residuals,
-                data_resolution=self.data_resolution,
-                per_feature=True,
-                include_quantization=True,
-            )
-        else:
-            # Original single-transform approach
-            lam_grid = self._lam_grid.to(device=original.device, dtype=original.dtype) if self._lam_grid is not None else None
-            res_bits = residual_bits_transformed_gradsafe(
-                original=original,
-                reconstructed=reconstructed,
-                lam_grid=lam_grid,
-                method=self.method,
-                include_param_bits=self.include_transform_param_bits,
-                data_resolution=self.data_resolution,
-                use_parallel_sa=self.use_parallel_sa,
-            )
-        
-        # Choose parameter encoding method  
-        if self.per_layer_parameters:
-            from .parameters import parameter_bits_by_layer
-            par_bits = parameter_bits_by_layer(
-                model,
-                param_resolution=self.param_resolution,
-                use_parallel_sa=self.use_parallel_sa,
-            )
-        else:
-            # Original approach - all parameters together
-            par_bits = parameter_bits_model_student_t(
-                model, 
-                include_param_bits=True, 
-                param_resolution=self.param_resolution,
-                use_parallel_sa=self.use_parallel_sa
-            )
-        
-        return res_bits + par_bits
+        self.data_resolution = data_resolution
+        self.param_resolution = param_resolution
+        self.normalizer_hidden = normalizer_hidden
+        self.normalizer_lr = normalizer_lr
+        self.train_normalizer_steps = train_normalizer_steps
+        self.device = device
+        self._normalizer: Optional[_Normalizer] = None
+        self._optim: Optional[torch.optim.Optimizer] = None
 
-# === Auto data-resolution + convenience wrappers ===
+    def _ensure_normalizer(self, feat_dim: int, device: torch.device):
+        if self._normalizer is None or self._normalizer.num_features != feat_dim:
+            self._normalizer = _Normalizer(feat_dim, hidden=self.normalizer_hidden).to(device)
+            self._optim = torch.optim.Adam(self._normalizer.parameters(), lr=self.normalizer_lr)
 
-import numpy as _np
-def _estimate_global_resolution_from_tensor(
-    x: torch.Tensor,
-    sample_per_col: int = 20_000,
-    min_positive: float = 1e-12,
-    clamp_low: float = 1e-12,
-    clamp_high: float = 2.5e-1,
-) -> float:
-    if x is None:
-        return 1e-6
-    if x.ndim == 1:
-        x = x.reshape(-1, 1)
-    elif x.ndim > 2:
-        x = x.reshape(x.shape[0], -1)
-    with torch.no_grad():
-        x_np = x.detach().to("cpu").numpy().astype(_np.float64, copy=False)
-    gaps = []
-    n_rows, n_cols = x_np.shape
-    rng = _np.random.default_rng(42)
-    for j in range(n_cols):
-        col = x_np[:, j]
-        col = col[~_np.isnan(col)]
-        if col.size == 0:
-            continue
-        if sample_per_col > 0 and col.size > sample_per_col:
-            col = rng.choice(col, size=sample_per_col, replace=False)
-        col = _np.asarray(col, dtype=_np.float64)
-        col = _np.unique(_np.sort(col))
-        if col.size < 2:
-            continue
-        diffs = _np.diff(col)
-        pos = diffs[diffs > min_positive]
-        if pos.size:
-            gaps.append(float(_np.min(pos)))
-    if not gaps:
-        return 1e-6
-    res = float(_np.median(gaps))
-    return float(_np.clip(res, clamp_low, clamp_high))
+    @torch.no_grad()
+    def _predict_lambda(self, residuals: torch.Tensor) -> torch.Tensor:
+        self._normalizer.eval()
+        return self._normalizer(residuals)
 
-def compute_mdl(
-    x: torch.Tensor,
-    yhat: torch.Tensor,
-    model: torch.nn.Module,
-    *,
-    method: str = "yeo-johnson",
-    data_resolution: float | str = "auto",
-    param_resolution: float = 1e-6,
-) -> torch.Tensor:
-    if isinstance(data_resolution, str) and data_resolution.lower() == "auto":
-        dr = _estimate_global_resolution_from_tensor(x)
-    else:
-        dr = float(data_resolution)
-    loss = MDLLoss(method=method, data_resolution=dr, param_resolution=param_resolution)
-    return loss(x, yhat, model)
+    def _train_normalizer(self, residuals: torch.Tensor):
+        self._normalizer.train()
+        for _ in range(self.train_normalizer_steps):
+            lam = self._normalizer(residuals.detach())
+            y, _ = yeo_johnson(residuals.detach(), lam)
+            moments = _calc_moments(y)
+            loss = _moment_distance(moments)
+            self._optim.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self._normalizer.parameters(), 1.0)
+            self._optim.step()
 
-def report_mdl(
-    x: torch.Tensor,
-    yhat: torch.Tensor,
-    model: torch.nn.Module,
-    *,
-    method: str = "yeo-johnson",
-    data_resolution: float | str = "auto",
-    param_resolution: float = 1e-6,
-) -> dict:
-    if isinstance(data_resolution, str) and data_resolution.lower() == "auto":
-        dr = _estimate_global_resolution_from_tensor(x)
-    else:
-        dr = float(data_resolution)
-    loss = MDLLoss(method=method, data_resolution=dr, param_resolution=param_resolution)
-    total = loss(x, yhat, model)
-    param_bits = loss.calculate_parameter_bits(model) if hasattr(loss, "calculate_parameter_bits") else None
-    residual_bits = loss.calculate_residual_bits(x, yhat) if hasattr(loss, "calculate_residual_bits") else None
-    n = max(int(x.numel()), 1)
-    return {
-        "total_bits": float(total.item()),
-        "bits_per_entry": float(total.item()) / n,
-        "parameter_bits": (float(param_bits.item()) if isinstance(param_bits, torch.Tensor) else param_bits),
-        "residual_bits": (float(residual_bits.item()) if isinstance(residual_bits, torch.Tensor) else residual_bits),
-        "data_resolution": float(dr),
-        "method": method,
-    }
+    def forward(self, x: torch.Tensor, yhat: torch.Tensor, model: nn.Module) -> torch.Tensor:
+        """
+        Returns total MDL (bits) as a differentiable scalar tensor.
+        Gradients flow into `model` (through yhat) but the internal normalizer
+        is updated with its own optimizer/state.
+        """
+        if x.dim() != 2 or yhat.dim() != 2:
+            raise ValueError("x and yhat must be [batch, features].")
+        if x.shape != yhat.shape:
+            raise ValueError("x and yhat must have same shape.")
+
+        device = yhat.device
+        B, F = x.shape
+        self._ensure_normalizer(F, device)
+
+        # Train/update the normalizer's λ prediction on current residuals
+        with torch.no_grad():
+            residuals_detached = (x - yhat).detach()
+        self._train_normalizer(residuals_detached)
+
+        # Predict λ (no grad for normalizer, to keep model/normalizer decoupled)
+        with torch.no_grad():
+            lam = self._predict_lambda(residuals_detached)  # [F]
+
+        # Apply transform with fixed λ (treat λ as constant wrt model grads)
+        y_trans, logJ = yeo_johnson(x - yhat, lam)  # keep graph through (x - yhat)
+        centered = y_trans - y_trans.mean(dim=0, keepdim=True)
+
+        # Residual coding bits (Gaussian) + Jacobian correction + quantization + λ cost
+        diff_bits = _gaussian_bits(centered)
+        jac_bits = -logJ.sum() / math.log(2.0)
+        quant_bits = _quant_bits(B * F, self.data_resolution)
+        lambda_bits = F * math.log2(100.0)  # ~6.64 bits/feature (coarse prior)
+
+        residual_bits = diff_bits + jac_bits + quant_bits + lambda_bits
+
+        # Parameter bits for the model
+        parameter_bits = _param_bits(model, self.param_resolution)
+
+        total_bits = residual_bits + parameter_bits
+        return total_bits
