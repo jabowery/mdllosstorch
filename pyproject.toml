@@ -9,33 +9,31 @@ description = "MDL loss components for PyTorch: transformed residuals (Yeo-Johns
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-authors = [
-    { name = "MDL Labs" }
-]
+authors = [{ name = "MDL Labs" }]
 
 # Runtime dependencies (minimal, permissive)
 dependencies = [
-    "torch>=1.12",
-    "numpy"
+  "torch>=2.0",
+  "numpy",
 ]
 
 [project.optional-dependencies]
 # Developer / test stack
 dev = [
-    "pytest>=8",
-    "ruff>=0.5",
-    "black>=24",
-    "mypy>=1",
-    "pre-commit>=3.5",
-    "tox>=4",
-    "build>=1.2",
-    "twine>=5",
-    # tools for generating constraints
-    "pip-tools>=7",
-    "uv>=0.3"
+  "pytest>=8",
+  "pytest-env>=1.1.5",        # set env vars from pyproject for tests
+  "ruff>=0.5",
+  "black>=24",
+  "mypy>=1",
+  "pre-commit>=3.5",
+  "tox>=4",
+  "build>=1.2",
+  "twine>=5",
+  "pip-tools>=7",
+  "uv>=0.3",
+  "validate-pyproject>=0.18", # validate pyproject.toml structure
 ]
 
-#
 # Optional dependency required ONLY for the census integration test(s)
 census = [
   "pandas>=2.0",
@@ -44,8 +42,8 @@ census = [
 
 # Docs stack
 docs = [
-    "mkdocs",
-    "mkdocs-material"
+  "mkdocs",
+  "mkdocs-material",
 ]
 
 [project.urls]
@@ -69,7 +67,15 @@ target-version = "py39"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "W"]
 
+# Single source of truth for pytest config
 [tool.pytest.ini_options]
 addopts = "-q -ra"
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "slow: marks tests as slow",
+]
+# Ensure census dataset path is visible to tests
+env = [
+  "LOTC_CENSUS_BZ2=datasets/LaboratoryOfTheCounties.tsv.bz2",
+]

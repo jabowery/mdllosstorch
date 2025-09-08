@@ -1,491 +1,606 @@
-# mdlloss.py - Clean API with private implementation details
+# --- put near your imports ---
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
-import torch.nn as nn
+
+try:
+    from torch import vmap  # PyTorch ≥ 2.1
+except Exception:
+    from torch.func import vmap  # PyTorch 2.0 fallback
 
 
-class MDLNumericalError(Exception):
-    """Exception for truly unrecoverable numerical issues.""" 
-    pass
-
-
-def _estimate_feature_complexity(residuals: torch.Tensor) -> torch.Tensor:
+def nanvar(x: torch.Tensor, unbiased: bool = True) -> torch.Tensor:
     """
-    Estimate optimization complexity for each feature.
-    Higher complexity means higher initial temperature needed.
+    NaN-aware variance calculation.
     """
-    B, F = residuals.shape
-    complexity = torch.zeros(F, device=residuals.device)
-    
-    for j in range(F):
-        col = residuals[:, j]
-        finite_col = col[torch.isfinite(col)]
-        
-        if finite_col.numel() < 10:
-            complexity[j] = 1.0  # Default
-            continue
-        
-        # Indicators of optimization difficulty
-        var = finite_col.var()
-        abs_skew = torch.abs(finite_col - finite_col.median()).mean()
-        range_ratio = (finite_col.max() - finite_col.min()) / (finite_col.std() + 1e-8)
-        
-        # Combine into complexity score
-        complexity[j] = 1.0 + 0.1 * torch.log1p(var) + 0.05 * abs_skew + 0.02 * range_ratio
-        
-    return complexity.clamp(0.1, 10.0)
+    finite_mask = torch.isfinite(x)
+    n_finite = finite_mask.sum()
+
+    # Handle case with too few finite values
+    too_few_case = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+
+    # Compute variance without boolean indexing
+    # Replace non-finite values with 0 for mean calculation
+    x_clean = torch.where(finite_mask, x, torch.tensor(0.0, device=x.device, dtype=x.dtype))
+    mean_val = x_clean.sum() / n_finite.clamp_min(1)  # Avoid division by zero
+
+    # Compute squared deviations, masking out non-finite values
+    sq_dev = torch.where(
+        finite_mask, (x - mean_val) ** 2, torch.tensor(0.0, device=x.device, dtype=x.dtype)
+    )
+
+    # Compute variance
+    if unbiased:
+        enough_data_case = sq_dev.sum() / (n_finite - 1).clamp_min(1)
+    else:
+        enough_data_case = sq_dev.sum() / n_finite.clamp_min(1)
+
+    # Use torch.where instead of if-statement
+    return torch.where(n_finite <= 1, too_few_case, enough_data_case)
 
 
-def _evaluate_two_param_score(col_residuals: torch.Tensor, lam1: float, lam2: float) -> float:
-    """Evaluate quality of lambda parameters for a single feature."""
-    try:
-        # Apply transform
-        lam1_tensor = torch.tensor(lam1, device=col_residuals.device)
-        lam2_tensor = torch.tensor(lam2, device=col_residuals.device)
-        
-        y, _ = _two_param_yeo_johnson(
-            col_residuals.unsqueeze(1), 
-            lam1_tensor.unsqueeze(0), 
-            lam2_tensor.unsqueeze(0)
-        )
-        
-        finite_mask = torch.isfinite(y[:, 0])
-        if finite_mask.sum() < 5:
-            return 1e6
-        
-        y_finite = y[finite_mask, 0]
-        
-        # Score based on normality (minimize departure from standard normal)
-        mean = y_finite.mean()
-        var = y_finite.var(unbiased=False)
-        centered = y_finite - mean
-        std = torch.sqrt(var + 1e-12)
-        z = centered / std
-        
-        skew = z.pow(3).mean()
-        kurt = z.pow(4).mean() - 3.0
-        
-        # Penalize extreme departures from normality
-        score = skew.pow(2) + kurt.pow(2) + (var - 1.0).pow(2) + mean.pow(2)
-        return score.item()
-        
-    except Exception:
-        return 1e6
-
-
-def _optimize_feature_lambdas_sa(col_residuals: torch.Tensor, 
-                               complexity: float,
-                               max_steps: int = 2000) -> Tuple[float, float]:
+def nanmax(x: torch.Tensor) -> torch.Tensor:
     """
-    Optimize lambda1, lambda2 for a single feature using simulated annealing.
-    Temperature schedule adapts based on feature complexity.
+    NaN-aware maximum.
     """
-    # Initialize
-    current_lam1 = torch.randn(1).item() * 0.5
-    current_lam2 = torch.randn(1).item() * 0.5
-    current_score = _evaluate_two_param_score(col_residuals, current_lam1, current_lam2)
-    
-    best_lam1, best_lam2, best_score = current_lam1, current_lam2, current_score
-    
-    # Temperature schedule based on complexity
-    initial_temp = complexity * 2.0
-    
-    accept_count = 0
-    total_proposals = 0
-    
-    for step in range(max_steps):
-        # Temperature schedule
-        progress = step / max_steps
-        temp = initial_temp * (0.995 ** step)
-        
-        # Early termination if temperature too low
-        if temp < 0.001:
-            break
-        
-        # Adaptive compute: fewer proposals as temperature decreases
-        temp_ratio = temp / initial_temp
-        n_proposals = max(1, int(10 * temp_ratio))
-        
-        for _ in range(n_proposals):
-            # Propose new parameters
-            step_size = temp * 0.1
-            proposed_lam1 = current_lam1 + torch.randn(1).item() * step_size
-            proposed_lam2 = current_lam2 + torch.randn(1).item() * step_size
-            
-            # Clamp to safe bounds
-            proposed_lam1 = max(-1.9, min(1.9, proposed_lam1))
-            proposed_lam2 = max(-1.9, min(1.9, proposed_lam2))
-            
-            # Evaluate
-            proposed_score = _evaluate_two_param_score(col_residuals, proposed_lam1, proposed_lam2)
-            
-            # Accept/reject
-            total_proposals += 1
-            if proposed_score < current_score or torch.rand(1).item() < math.exp(-(proposed_score - current_score) / temp):
-                current_lam1, current_lam2, current_score = proposed_lam1, proposed_lam2, proposed_score
-                accept_count += 1
-                
-                # Track best
-                if current_score < best_score:
-                    best_lam1, best_lam2, best_score = current_lam1, current_lam2, current_score
-    
+    finite_mask = torch.isfinite(x)
+    n_finite = finite_mask.sum()
+
+    # Handle case with no finite values
+    no_finite_case = torch.tensor(float("nan"), device=x.device, dtype=x.dtype)
+
+    # Replace non-finite values with -inf, then take max
+    x_clean = torch.where(
+        finite_mask, x, torch.tensor(float("-inf"), device=x.device, dtype=x.dtype)
+    )
+    has_finite_case = x_clean.max()
+
+    # Use torch.where instead of if-statement
+    return torch.where(n_finite == 0, no_finite_case, has_finite_case)
+
+
+def nanmin(x: torch.Tensor) -> torch.Tensor:
+    """
+    NaN-aware minimum.
+    """
+    finite_mask = torch.isfinite(x)
+    n_finite = finite_mask.sum()
+
+    # Handle case with no finite values
+    no_finite_case = torch.tensor(float("nan"), device=x.device, dtype=x.dtype)
+
+    # Replace non-finite values with +inf, then take min
+    x_clean = torch.where(
+        finite_mask, x, torch.tensor(float("inf"), device=x.device, dtype=x.dtype)
+    )
+    has_finite_case = x_clean.min()
+
+    # Use torch.where instead of if-statement
+    return torch.where(n_finite == 0, no_finite_case, has_finite_case)
+
+
+def two_param_yeo_johnson(x: torch.Tensor, lam1: torch.Tensor, lam2: torch.Tensor):
+    """
+    Two-parameter Yeo-Johnson for a feature.
+    x: [N] (1-D), lam1, lam2: scalars (0-D tensors or floats)
+    returns: y:[N], log_jac:[N]
+    """
+    x = x.to(dtype=torch.get_default_dtype())
+    lam1 = torch.as_tensor(lam1, dtype=x.dtype, device=x.device)
+    lam2 = torch.as_tensor(lam2, dtype=x.dtype, device=x.device)
+
+    pos = x >= 0
+    neg = ~pos
+    # positive branch (λ1) - vectorized
+    # Case 1: lam1 ≈ 0 (use log1p)
+    eps = torch.finfo(lam1.dtype).eps * 5
+    #    lam1_is_zero = torch.isclose(lam1, torch.tensor(0.0, device=x.device, dtype=x.dtype))
+    lam1_is_zero = torch.abs(lam1) < eps
+    y_pos_log = torch.log1p(x)
+    lj_pos_log = -torch.log1p(x)
+
+    # Case 2: lam1 ≠ 0 (use power transform)
+    y_pos_power = ((1 + x) ** lam1 - 1) / lam1
+    lj_pos_power = (lam1 - 1) * torch.log1p(x)
+
+    # Select based on lambda value
+    y_pos = torch.where(lam1_is_zero, y_pos_log, y_pos_power)
+    lj_pos = torch.where(lam1_is_zero, lj_pos_log, lj_pos_power)
+
+    # negative branch (λ2) - vectorized
+    # Case 1: lam2 ≈ 2 (use log1p)
+    # lam2_is_two = torch.isclose(lam2, torch.tensor(2.0, device=x.device, dtype=x.dtype))
+    lam2_is_two = torch.abs(lam2 - 2.0) < eps
+    y_neg_log = -torch.log1p(-x)
+    lj_neg_log = -torch.log1p(-x)
+
+    # Case 2: lam2 ≠ 2 (use power transform)
+    base = (1 - x).clamp_min(1e-18)
+    y_neg_power = -((base ** (2 - lam2) - 1) / (2 - lam2))
+    lj_neg_power = (1 - lam2) * torch.log(base)
+
+    # Select based on lambda value
+    y_neg = torch.where(lam2_is_two, y_neg_log, y_neg_power)
+    lj_neg = torch.where(lam2_is_two, lj_neg_log, lj_neg_power)
+
+    # Combine positive and negative branches using torch.where
+    y = torch.where(pos, y_pos, y_neg)
+    lj = torch.where(pos, lj_pos, lj_neg)
+
+    return y, lj
+
+
+def feature_complexity(x: torch.Tensor) -> torch.Tensor:
+    """
+    Heuristic complexity for a feature (scalar).
+    x: [N]
+    """
+    finite = torch.isfinite(x)
+    n = finite.sum()
+
+    # Replace if-statement with torch.where for vmap compatibility
+    small_n_case = torch.tensor(1.0, device=x.device, dtype=x.dtype)
+
+    # Compute the full complexity calculation
+    xf = torch.where(finite, x, torch.nan)
+    var = nanvar(xf, unbiased=False).clamp_min(0.0)
+    med = torch.nanmedian(xf)
+    abs_skew = torch.nanmean(torch.abs(xf - med))
+    std = torch.sqrt(nanvar(xf, unbiased=False).clamp_min(1e-12))
+    xmax = nanmax(xf)
+    xmin = nanmin(xf)
+    range_ratio = (xmax - xmin) / (std + 1e-12)
+
+    score = 1.0 + 0.1 * torch.log1p(var) + 0.05 * abs_skew + 0.02 * range_ratio
+    full_complexity = score.clamp(0.1, 10.0)
+
+    # Use torch.where instead of if-statement
+    return torch.where(n < 10, small_n_case, full_complexity)
+
+
+def feature_resolution(x: torch.Tensor) -> torch.Tensor:
+    """
+    Robust per-feature resolution (scalar): median positive gap in sorted finite values.
+    x: [N]
+    """
+    finite = torch.isfinite(x)
+
+    # Handle case with too few finite values
+    too_few_case = torch.tensor(1e-6, device=x.device, dtype=x.dtype)
+
+    # Compute full resolution calculation
+    xs, _ = torch.sort(
+        torch.where(finite, x, torch.tensor(float("inf"), device=x.device, dtype=x.dtype))
+    )
+    diffs = torch.diff(xs)
+    pos = torch.where(
+        diffs > 1e-12, diffs, torch.tensor(float("nan"), device=x.device, dtype=x.dtype)
+    )
+    res = torch.nanmedian(pos)
+
+    # Handle case where no valid differences found
+    no_valid_case = torch.tensor(1e-6, device=x.device, dtype=x.dtype)
+    valid_res = torch.where(torch.isfinite(res), res, no_valid_case)
+    final_res = valid_res.clamp(1e-12, 1e-1)
+
+    # Use torch.where instead of if-statement
+    return torch.where(finite.sum() < 2, too_few_case, final_res)
+
+
+def feature_bits(y: torch.Tensor, log_jac: torch.Tensor, resolution: torch.Tensor) -> torch.Tensor:
+    """
+    Bits for a feature (scalar).
+    y: [N] transformed residuals; log_jac: [N]; resolution: scalar
+    """
+    finite = torch.isfinite(y)
+    n_f = finite.sum()
+    n = torch.tensor(y.numel(), device=y.device, dtype=y.dtype)
+    n_ex = n - n_f
+
+    # Handle variance calculation without boolean indexing
+    few_points_case = torch.tensor(0.0, device=y.device, dtype=y.dtype)
+
+    # Compute variance manually without boolean indexing
+    y_clean = torch.where(finite, y, torch.tensor(0.0, device=y.device, dtype=y.dtype))
+    mean_val = y_clean.sum() / n_f.clamp_min(1)
+    sq_dev = torch.where(
+        finite, (y - mean_val) ** 2, torch.tensor(0.0, device=y.device, dtype=y.dtype)
+    )
+    var = (sq_dev.sum() / n_f.clamp_min(1)).clamp_min(1e-12)
+
+    many_points_case = n_f * (0.5 * math.log2(2 * math.pi * math.e) + 0.5 * torch.log2(var))
+    diff_bits = torch.where(n_f > 1, many_points_case, few_points_case)
+
+    # log jacobian contribution - fix this too
+    no_finite_case = torch.tensor(0.0, device=y.device, dtype=y.dtype)
+
+    # Replace log_jac[finite].sum() with masked sum
+    lj_clean = torch.where(finite, log_jac, torch.tensor(0.0, device=y.device, dtype=y.dtype))
+    has_finite_case = lj_clean.sum() / math.log(2.0)
+    lj_bits = torch.where(n_f > 0, has_finite_case, no_finite_case)
+
+    # exception positions encoded at given resolution - keep in tensor form
+    log2_inv_res = torch.log2(1.0 / resolution)  # Keep as tensor
+    ex_bits = torch.where(
+        n_ex > 0, n_ex * log2_inv_res, torch.tensor(0.0, device=y.device, dtype=y.dtype)
+    )
+
+    # partition bits for exceptions - fix the lgamma calls too
+    no_ex_case = torch.tensor(0.0, device=y.device, dtype=y.dtype)
+
+    # Calculate log_binom when we have some but not all exceptions
+    has_partial_ex = (n_ex > 0) & (n_ex < n)
+
+    # Use torch.lgamma instead of math.lgamma to keep tensor operations
+    log_binom = torch.where(
+        has_partial_ex,
+        torch.lgamma(n + 1) - torch.lgamma(n_ex + 1) - torch.lgamma(n - n_ex + 1),
+        torch.tensor(0.0, device=y.device, dtype=y.dtype),
+    )
+    part_bits = torch.where(has_partial_ex, log_binom / math.log(2.0), no_ex_case)
+
+    # simple λ prior (constant per feature)
+    lambda_bits = torch.tensor(2 * math.log2(100.0), device=y.device, dtype=y.dtype)
+
+    return diff_bits + lj_bits + ex_bits + part_bits + lambda_bits
+
+
+def evaluate_yj_score(x: torch.Tensor, lam1: torch.Tensor, lam2: torch.Tensor) -> torch.Tensor:
+    """
+    Evaluate the YJ transformation and return bits score for given lambdas.
+    x: [N] - feature values
+    lam1, lam2: scalar tensors - lambda parameters
+    Returns: scalar bits score
+    """
+    y, log_jac = two_param_yeo_johnson(x, lam1, lam2)
+    resolution = feature_resolution(x)
+    return feature_bits(y, log_jac, resolution)
+
+
+def optimize_feature_lambdas_sa(
+    x: torch.Tensor, feature_idx: torch.Tensor, mdl_loss_ref
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Simulated annealing optimization for (λ1, λ2) for a single feature.
+    x: [N] - feature values
+    feature_idx: scalar tensor - index of this feature
+    mdl_loss_ref: reference to MDLLoss instance for state access
+    Returns: (lam1, lam2) as scalar tensors
+    """
+    idx = int(feature_idx.item())
+
+    # Get current state
+    current_lam1, current_lam2 = mdl_loss_ref.get_lambdas(idx)
+    temperature = mdl_loss_ref.get_temperature(idx)
+
+    # Current score
+    current_score = evaluate_yj_score(x, current_lam1, current_lam2)
+
+    # Generate 5 proposals around current lambdas
+    std_dev = 0.1 * temperature  # Scale proposals by temperature
+
+    # Create 5 proposal pairs (explicitly serial computation)
+    prop1_lam1 = current_lam1 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop1_lam2 = current_lam2 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop1_score = evaluate_yj_score(x, prop1_lam1, prop1_lam2)
+
+    prop2_lam1 = current_lam1 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop2_lam2 = current_lam2 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop2_score = evaluate_yj_score(x, prop2_lam1, prop2_lam2)
+
+    prop3_lam1 = current_lam1 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop3_lam2 = current_lam2 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop3_score = evaluate_yj_score(x, prop3_lam1, prop3_lam2)
+
+    prop4_lam1 = current_lam1 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop4_lam2 = current_lam2 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop4_score = evaluate_yj_score(x, prop4_lam1, prop4_lam2)
+
+    prop5_lam1 = current_lam1 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop5_lam2 = current_lam2 + std_dev * torch.randn(1, device=x.device, dtype=x.dtype)
+    prop5_score = evaluate_yj_score(x, prop5_lam1, prop5_lam2)
+
+    # Stack all candidates (current + 5 proposals)
+    all_lam1 = torch.stack(
+        [
+            current_lam1,
+            prop1_lam1.squeeze(),
+            prop2_lam1.squeeze(),
+            prop3_lam1.squeeze(),
+            prop4_lam1.squeeze(),
+            prop5_lam1.squeeze(),
+        ]
+    )
+    all_lam2 = torch.stack(
+        [
+            current_lam2,
+            prop1_lam2.squeeze(),
+            prop2_lam2.squeeze(),
+            prop3_lam2.squeeze(),
+            prop4_lam2.squeeze(),
+            prop5_lam2.squeeze(),
+        ]
+    )
+    all_scores = torch.stack(
+        [current_score, prop1_score, prop2_score, prop3_score, prop4_score, prop5_score]
+    )
+
+    # Find best
+    best_idx = torch.argmin(all_scores)
+    best_lam1 = all_lam1[best_idx]
+    best_lam2 = all_lam2[best_idx]
+
+    # Update state (this will be called from the main thread after vmap)
+    mdl_loss_ref.update_feature_state(idx, best_lam1, best_lam2, temperature * 0.95)
+
     return best_lam1, best_lam2
 
 
-def _optimize_all_features_parallel(residuals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def optimize_feature_lambdas(x: torch.Tensor, complexity_hint: torch.Tensor):
     """
-    Optimize lambda parameters for all features using parallel simulated annealing.
+    Fallback lambda optimization (simplified version).
+    This is kept for compatibility but won't be used in SA version.
     """
-    B, F = residuals.shape
-    
-    # Estimate per-feature complexity
-    complexities = _estimate_feature_complexity(residuals)
-    
-    lambda1_opt = torch.zeros(F, device=residuals.device)
-    lambda2_opt = torch.zeros(F, device=residuals.device)
-    
-    # Optimize each feature independently (could be parallelized)
-    for j in range(F):
-        col_residuals = residuals[:, j]
-        finite_mask = torch.isfinite(col_residuals)
-        
-        if finite_mask.sum() < 10:
-            # Not enough data, use default
-            lambda1_opt[j] = 0.0
-            lambda2_opt[j] = 0.0
-            continue
-        
-        col_finite = col_residuals[finite_mask]
-        lam1, lam2 = _optimize_feature_lambdas_sa(col_finite, complexities[j].item())
-        
-        lambda1_opt[j] = lam1
-        lambda2_opt[j] = lam2
-    
-    return lambda1_opt, lambda2_opt
+    finite = torch.isfinite(x)
+    too_few_case = (
+        torch.tensor(0.0, device=x.device, dtype=x.dtype),
+        torch.tensor(0.0, device=x.device, dtype=x.dtype),
+    )
+
+    # Simple heuristic lambdas based on complexity
+    lam1 = complexity_hint * 0.1
+    lam2 = complexity_hint * 0.1 + 1.0
+    enough_data_case = (lam1, lam2)
+
+    # Use torch.where pattern (though this returns tuples, need to handle carefully)
+    use_simple = finite.sum() < 10
+    final_lam1 = torch.where(use_simple, too_few_case[0], enough_data_case[0])
+    final_lam2 = torch.where(use_simple, too_few_case[1], enough_data_case[1])
+
+    return final_lam1, final_lam2
 
 
-def _estimate_per_parameter_resolutions(model: nn.Module) -> Dict[str, float]:
+def process_single_feature_sa_stateless(
+    x_col: torch.Tensor, lam1: torch.Tensor, lam2: torch.Tensor, random_proposals: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Estimate resolution for each parameter based on its empirical distribution.
+    Process one feature column through SA pipeline (stateless version).
+
+    x_col: [N] - one feature column
+    lam1, lam2: scalar tensors - current lambda values
+    random_proposals: [10] tensor of random numbers for proposals
+    Returns: (bits, best_lam1, best_lam2) for this feature
     """
-    resolutions = {}
-    
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-            
-        flat = param.data.reshape(-1)
-        if flat.numel() == 0:
-            continue
-        
-        # Estimate resolution from parameter value distribution
-        sorted_vals, _ = torch.sort(flat)
-        if sorted_vals.numel() > 1:
-            diffs = torch.diff(sorted_vals)
-            pos_diffs = diffs[diffs > 1e-12]
-            if pos_diffs.numel() > 0:
-                resolution = pos_diffs.median().item()
-            else:
-                resolution = 1e-6
-        else:
-            resolution = 1e-6
-            
-        # Conservative clipping
-        resolution = max(1e-12, min(1e-3, resolution))
-        resolutions[name] = resolution
-    
-    return resolutions
+    # 1) Complexity (for temperature scaling)
+    complexity = feature_complexity(x_col)
+
+    # 2) Current score
+    current_score = evaluate_yj_score(x_col, lam1, lam2)
+
+    # 3) Generate 5 proposals using pre-generated random numbers
+    temperature = 1.0  # We'll make this adaptive later
+    std_dev = 0.1 * temperature
+
+    # Create 5 proposal pairs using the random numbers
+    prop1_lam1 = lam1 + std_dev * random_proposals[0]
+    prop1_lam2 = lam2 + std_dev * random_proposals[1]
+    prop1_score = evaluate_yj_score(x_col, prop1_lam1, prop1_lam2)
+
+    prop2_lam1 = lam1 + std_dev * random_proposals[2]
+    prop2_lam2 = lam2 + std_dev * random_proposals[3]
+    prop2_score = evaluate_yj_score(x_col, prop2_lam1, prop2_lam2)
+
+    prop3_lam1 = lam1 + std_dev * random_proposals[4]
+    prop3_lam2 = lam2 + std_dev * random_proposals[5]
+    prop3_score = evaluate_yj_score(x_col, prop3_lam1, prop3_lam2)
+
+    prop4_lam1 = lam1 + std_dev * random_proposals[6]
+    prop4_lam2 = lam2 + std_dev * random_proposals[7]
+    prop4_score = evaluate_yj_score(x_col, prop4_lam1, prop4_lam2)
+
+    prop5_lam1 = lam1 + std_dev * random_proposals[8]
+    prop5_lam2 = lam2 + std_dev * random_proposals[9]
+    prop5_score = evaluate_yj_score(x_col, prop5_lam1, prop5_lam2)
+
+    # Stack all candidates (current + 5 proposals)
+    all_lam1 = torch.stack([lam1, prop1_lam1, prop2_lam1, prop3_lam1, prop4_lam1, prop5_lam1])
+    all_lam2 = torch.stack([lam2, prop1_lam2, prop2_lam2, prop3_lam2, prop4_lam2, prop5_lam2])
+    all_scores = torch.stack(
+        [current_score, prop1_score, prop2_score, prop3_score, prop4_score, prop5_score]
+    )
+
+    # Find best using one-hot encoding instead of indexing
+    min_score = torch.min(all_scores)
+    is_best = (all_scores == min_score).float()  # One-hot vector for best score(s)
+
+    # If there are ties, this will average them (could also take first by using argmax trick)
+    # To take first in case of tie, use: is_best = torch.zeros_like(all_scores); is_best[torch.argmin(all_scores)] = 1.0
+    # But let's use the averaging approach to avoid indexing:
+    total_weight = is_best.sum().clamp_min(1e-8)  # Avoid division by zero
+    best_lam1 = (all_lam1 * is_best).sum() / total_weight
+    best_lam2 = (all_lam2 * is_best).sum() / total_weight
+
+    # Calculate final bits with best lambdas
+    y_col, lj_col = two_param_yeo_johnson(x_col, best_lam1, best_lam2)
+    resolution = feature_resolution(x_col)
+    bits = feature_bits(y_col, lj_col, resolution)
+
+    return bits, best_lam1, best_lam2
 
 
-def _estimate_per_feature_resolutions(residuals: torch.Tensor) -> torch.Tensor:
+def process_parameter_tensor(
+    param_tensor: torch.Tensor, fixed_resolution: torch.Tensor
+) -> torch.Tensor:
     """
-    Estimate resolution for each feature based on its residual distribution.
+    Process a parameter tensor as a "feature" with fixed resolution.
+
+    param_tensor: [N] - flattened parameter values
+    fixed_resolution: scalar tensor - predetermined resolution for this parameter type
+    Returns: scalar bits for this parameter tensor
     """
-    B, F = residuals.shape
-    resolutions = torch.zeros(F, device=residuals.device)
-    
-    for j in range(F):
-        col = residuals[:, j]
-        finite_col = col[torch.isfinite(col)]
-        
-        if finite_col.numel() < 2:
-            resolutions[j] = 1e-6
-            continue
-        
-        # Estimate from unique value gaps
-        sorted_vals, _ = torch.sort(finite_col)
-        unique_vals = torch.unique(sorted_vals)
-        
-        if unique_vals.numel() > 1:
-            diffs = torch.diff(unique_vals)
-            pos_diffs = diffs[diffs > 1e-12]
-            if pos_diffs.numel() > 0:
-                resolution = pos_diffs.median()
-            else:
-                resolution = torch.tensor(1e-6, device=residuals.device)
-        else:
-            resolution = torch.tensor(1e-6, device=residuals.device)
-        
-        resolutions[j] = resolution.clamp(1e-12, 1e-1)
-    
-    return resolutions
+    # Skip complexity and lambda optimization for parameters - use identity transform
+    # This treats parameters as already "normalized"
+    y = param_tensor
+    log_jac = torch.zeros_like(param_tensor)  # Identity transform has zero jacobian
+
+    # Calculate bits using the fixed resolution
+    bits = feature_bits(y, log_jac, fixed_resolution)
+
+    return bits
 
 
-def _compute_parameter_bits(model: nn.Module, param_resolutions: Dict[str, float]) -> torch.Tensor:
-    """Compute parameter encoding cost using per-parameter resolutions."""
-    try:
-        device = next(iter(model.parameters())).device
-    except StopIteration:
-        return torch.tensor(0.0)
-    
-    total = torch.tensor(0.0, device=device)
-    
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        
-        flat = param.reshape(-1)
-        if flat.numel() == 0:
-            continue
-        
-        resolution = param_resolutions.get(name, 1e-6)
-        
-        # Differential entropy
-        var = flat.var(unbiased=False).clamp_min(1e-12)
-        diff_bits = flat.numel() * (0.5 * math.log2(2 * math.pi * math.e) + 0.5 * torch.log2(var))
-        
-        # Quantization
-        quant_bits = flat.numel() * math.log2(1.0 / resolution)
-        
-        total = total + diff_bits + quant_bits
-    
-    return total
-
-
-class MDLLoss(nn.Module):
-    """
-    Sophisticated per-feature MDL loss with adaptive optimization.
-    
-    Estimates all resolutions automatically - no global parameters needed.
-    Uses two-parameter Yeo-Johnson transform with simulated annealing optimization.
-    """
-
-    def __init__(
-        self,
-        normalizer_lr: float = 1e-3,
-        sa_max_steps: int = 2000,
-        device: Optional[torch.device] = None,
-    ):
+class MDLLoss(torch.nn.Module):
+    def __init__(self, param_resolution_scale: float = 1e-12, weight_model_bits: float = 1.0):
+        """
+        param_resolution_scale: Base resolution for parameter quantization
+        weight_model_bits: Relative weight for model complexity vs data complexity
+        """
         super().__init__()
-        
-        self.normalizer_lr = normalizer_lr
-        self.sa_max_steps = sa_max_steps
-        self.device = device
+        self.param_resolution_scale = param_resolution_scale
+        self.weight_model_bits = weight_model_bits
 
-    def forward(self, x: torch.Tensor, yhat: torch.Tensor, model: nn.Module) -> torch.Tensor:
-        """
-        Compute MDL using sophisticated per-feature optimization.
-        
-        Args:
-            x: Original data [batch, features]
-            yhat: Model reconstruction [batch, features]  
-            model: PyTorch model used for reconstruction
-            
-        Returns:
-            total_bits: Total description length in bits
-        """
-        if x.dim() != 2 or yhat.dim() != 2:
-            raise ValueError("x and yhat must be [batch, features].")
-        if x.shape != yhat.shape:
-            raise ValueError("x and yhat must have same shape.")
+        # SA state management
+        self.feature_lambdas = {}  # feature_idx -> (lam1, lam2)
+        self.feature_temperatures = {}  # feature_idx -> temperature
+        self.feature_initialized = set()  # track which features have been initialized
 
-        device = yhat.device
-        B, F = x.shape
-        
-        if not torch.isfinite(x).all() or not torch.isfinite(yhat).all():
-            raise MDLNumericalError("Input contains non-finite values")
-        
-        # Compute residuals
-        residuals = x - yhat
-        if not torch.isfinite(residuals).all():
-            raise MDLNumericalError("Residuals contain non-finite values")
+    def get_current_lambdas_tensor(
+        self, num_features: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get current lambda tensors for all features."""
+        lam1_list = []
+        lam2_list = []
 
-        # Optimize lambda parameters per feature
-        lambda1_opt, lambda2_opt = _optimize_all_features_parallel(residuals)
-        
-        # Estimate per-feature resolutions
-        feature_resolutions = _estimate_per_feature_resolutions(residuals)
-        
-        # Compute residual encoding cost
-        residual_bits = _compute_per_feature_bits(residuals, lambda1_opt, lambda2_opt, feature_resolutions)
-        
-        # Estimate per-parameter resolutions and compute parameter cost
-        param_resolutions = _estimate_per_parameter_resolutions(model)
-        parameter_bits = _compute_parameter_bits(model, param_resolutions)
-        
-        # Total MDL
-        total_bits = residual_bits + parameter_bits
-        
-        if not torch.isfinite(total_bits):
-            raise MDLNumericalError("Non-finite MDL computed")
-        
-        return total_bits
-def _two_param_yeo_johnson(x: torch.Tensor, lambda1: torch.Tensor, lambda2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Two-parameter Yeo-Johnson transform with separate lambdas for positive and negative branches.
-    
-    Args:
-        x: Input values [B, F] 
-        lambda1: Parameters for positive branch [F]
-        lambda2: Parameters for negative branch [F]
-        
-    Returns:
-        y: Transformed values [B, F]
-        log_jacobian_terms: Log Jacobian terms per feature [B, F] - NOT collapsed to [B]
-    """
-    if x.numel() == 0:
-        raise MDLNumericalError("Empty input tensor")
-    
-    B, F = x.shape
-    if lambda1.shape != (F,) or lambda2.shape != (F,):
-        raise ValueError("Lambda parameters must have shape [F]")
-    
-    # Expand lambdas to match data shape
-    lam1 = lambda1.unsqueeze(0).expand(B, F)  # [B, F]
-    lam2 = lambda2.unsqueeze(0).expand(B, F)  # [B, F]
-    
-    y = torch.zeros_like(x)
-    log_jac_terms = torch.zeros_like(x)  # [B, F] - per feature, per sample
-    
-    # Positive branch: x >= 0
-    pos_mask = x >= 0
-    if pos_mask.any():
-        x_pos = x[pos_mask]
-        lam1_pos = lam1[pos_mask]
-        
-        eps = 1e-8
-        lam1_abs = torch.abs(lam1_pos)
-        
-        # Safe bounds check
-        safe_pos = (x_pos.abs() <= 1e3) & (lam1_abs <= 1.9)
-        
-        if safe_pos.any():
-            x_safe = x_pos[safe_pos]
-            lam_safe = lam1_pos[safe_pos]
-            
-            # Transform: ((x+1)^lambda - 1)/lambda or log(x+1) 
-            y_general = ((x_safe + 1.0).pow(lam_safe) - 1.0) / lam_safe
-            y_l0 = torch.log1p(x_safe)
-            y_transformed = torch.where(torch.abs(lam_safe) < eps, y_l0, y_general)
-            
-            # Log Jacobian: (lambda-1) * log(x+1)
-            lj_safe = (lam_safe - 1.0) * torch.log1p(x_safe)
-            
-            # Store results maintaining [B, F] structure
-            y_pos_safe = torch.full_like(x_pos, float('nan'))
-            lj_pos_safe = torch.zeros_like(x_pos)
-            
-            y_pos_safe[safe_pos] = y_transformed
-            lj_pos_safe[safe_pos] = lj_safe
-            
-            y[pos_mask] = y_pos_safe
-            log_jac_terms[pos_mask] = lj_pos_safe
-    
-    # Negative branch: x < 0
-    neg_mask = x < 0
-    if neg_mask.any():
-        x_neg = x[neg_mask]
-        lam2_neg = lam2[neg_mask]
-        
-        eps = 1e-8
-        
-        # Safe bounds: need x > -0.99 and reasonable lambda2
-        safe_neg = (x_neg > -0.99) & (torch.abs(lam2_neg) <= 1.9)
-        
-        if safe_neg.any():
-            x_safe = x_neg[safe_neg]
-            lam_safe = lam2_neg[safe_neg]
-            l2 = 2.0 - lam_safe
-            
-            # Transform: -(((1-x)^(2-lambda) - 1)/(2-lambda)) or -log(1-x)
-            y_general = -((1.0 - x_safe).pow(l2) - 1.0) / l2
-            y_l0 = -torch.log1p(-x_safe)
-            y_transformed = torch.where(torch.abs(l2) < eps, y_l0, y_general)
-            
-            # Log Jacobian: (1-lambda) * log(1-x)  
-            lj_safe = (1.0 - lam_safe) * torch.log1p(-x_safe)
-            
-            # Store results maintaining [B, F] structure
-            y_neg_safe = torch.full_like(x_neg, float('nan'))
-            lj_neg_safe = torch.zeros_like(x_neg)
-            
-            y_neg_safe[safe_neg] = y_transformed
-            lj_neg_safe[safe_neg] = lj_safe
-            
-            y[neg_mask] = y_neg_safe
-            log_jac_terms[neg_mask] = lj_neg_safe
-    
-    # Return per-feature log Jacobian terms [B, F], NOT collapsed to [B]
-    return y, log_jac_terms
-def _compute_per_feature_bits(residuals: torch.Tensor, 
-                           lambda1: torch.Tensor, 
-                           lambda2: torch.Tensor,
-                           resolutions: torch.Tensor) -> torch.Tensor:
-    """
-    Compute bits for each feature independently using its transform and resolution.
-    Properly respects per-feature architecture throughout.
-    """
-    B, F = residuals.shape
-    total_bits = torch.tensor(0.0, device=residuals.device)
-    
-    # Apply per-feature transforms - now returns per-feature Jacobian terms
-    y_trans, log_jac_terms = _two_param_yeo_johnson(residuals, lambda1, lambda2)
-    
-    # Process each feature independently - including its Jacobian contribution
-    for j in range(F):
-        col_transformed = y_trans[:, j]
-        col_jac_terms = log_jac_terms[:, j]  # Per-feature Jacobian terms
-        finite_mask = torch.isfinite(col_transformed)
-        n_finite = finite_mask.sum().item()
-        n_exceptions = B - n_finite
-        
-        if n_finite > 0:
-            # Differential entropy for transformed finite values
-            y_finite = col_transformed[finite_mask]
-            if y_finite.numel() > 1:
-                var = y_finite.var(unbiased=False).clamp_min(1e-12)
-                diff_bits = n_finite * (0.5 * math.log2(2 * math.pi * math.e) + 0.5 * torch.log2(var))
+        for i in range(num_features):
+            if i in self.feature_lambdas:
+                l1, l2 = self.feature_lambdas[i]
             else:
-                diff_bits = torch.tensor(0.0, device=residuals.device)
-        else:
-            diff_bits = torch.tensor(0.0, device=residuals.device)
-        
-        # Per-feature Jacobian contribution
-        finite_jac = col_jac_terms[finite_mask]
-        if finite_jac.numel() > 0:
-            jacobian_bits_j = finite_jac.sum() / math.log(2.0)
-        else:
-            jacobian_bits_j = torch.tensor(0.0, device=residuals.device)
-        
-        # Direct encoding for exceptions
-        exception_bits = n_exceptions * math.log2(1.0 / resolutions[j].item()) if n_exceptions > 0 else 0.0
-        
-        # Partition overhead
-        if n_exceptions > 0 and n_exceptions < B:
-            log_binom = (math.lgamma(B + 1) - 
-                        math.lgamma(n_exceptions + 1) - 
-                        math.lgamma(B - n_exceptions + 1))
-            partition_bits = log_binom / math.log(2.0)
-        else:
-            partition_bits = 0.0
-        
-        # Lambda encoding (2 parameters per feature)
-        lambda_bits = 2 * math.log2(100.0)
-        
-        # Sum all per-feature contributions
-        feature_bits = diff_bits + jacobian_bits_j + exception_bits + partition_bits + lambda_bits
-        total_bits = total_bits + feature_bits
-    
-    return total_bits
+                l1, l2 = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+            lam1_list.append(l1)
+            lam2_list.append(l2)
+
+        return torch.stack(lam1_list), torch.stack(lam2_list)
+
+    def update_all_feature_states(
+        self, new_lam1_tensor: torch.Tensor, new_lam2_tensor: torch.Tensor
+    ):
+        """Update all feature states from tensors."""
+        for i in range(new_lam1_tensor.shape[0]):
+            self.feature_lambdas[i] = (new_lam1_tensor[i].detach(), new_lam2_tensor[i].detach())
+            # Simple temperature decay
+            current_temp = self.feature_temperatures.get(i, 1.0)
+            self.feature_temperatures[i] = current_temp * 0.95
+
+    # ... (keep other methods the same)
+
+    def forward(self, residuals: torch.Tensor, model: torch.nn.Module) -> torch.Tensor:
+        """
+        residuals: [N, num_features] - data residuals to encode
+        model: nn.Module - model whose parameters contribute to complexity
+        """
+        num_features = residuals.shape[1]
+        device = residuals.device
+
+        # Get current lambda states as tensors
+        current_lam1, current_lam2 = self.get_current_lambdas_tensor(num_features, device)
+
+        # Generate random proposals outside of vmap (10 random numbers per feature)
+        random_proposals = torch.randn(num_features, 10, device=device)
+
+        # Data complexity: process residual features with SA (vmap compatible)
+        def process_stateless(x_col, lam1, lam2, rand_props):
+            return process_single_feature_sa_stateless(x_col, lam1, lam2, rand_props)
+
+        # vmap over features
+        results = vmap(process_stateless, in_dims=(1, 0, 0, 0), out_dims=(0, 0, 0))(
+            residuals, current_lam1, current_lam2, random_proposals
+        )
+        bits_features, new_lam1, new_lam2 = results
+
+        # Update states (outside vmap)
+        self.update_all_feature_states(new_lam1, new_lam2)
+
+        data_bits = bits_features.sum()
+
+        # Model complexity: process parameter tensors as features
+        model_bits = self.compute_model_bits(model)
+
+        # Weighted combination
+        return data_bits + self.weight_model_bits * model_bits
+
+    def is_initialized(self, feature_idx: int) -> bool:
+        """Check if a feature has been initialized."""
+        return feature_idx in self.feature_initialized
+
+    def initialize_feature(self, feature_idx: int, initial_temp: float):
+        """Initialize a feature's SA state."""
+        self.feature_lambdas[feature_idx] = (torch.tensor(0.0), torch.tensor(0.0))
+        self.feature_temperatures[feature_idx] = initial_temp
+        self.feature_initialized.add(feature_idx)
+
+    def get_lambdas(self, feature_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get current lambda pair for a feature."""
+        if feature_idx not in self.feature_lambdas:
+            return torch.tensor(0.0), torch.tensor(0.0)
+        return self.feature_lambdas[feature_idx]
+
+    def get_temperature(self, feature_idx: int) -> float:
+        """Get current temperature for a feature."""
+        return self.feature_temperatures.get(feature_idx, 1.0)
+
+    def update_feature_state(
+        self, feature_idx: int, new_lam1: torch.Tensor, new_lam2: torch.Tensor, new_temp: float
+    ):
+        """Update a feature's SA state."""
+        self.feature_lambdas[feature_idx] = (new_lam1.detach(), new_lam2.detach())
+        self.feature_temperatures[feature_idx] = new_temp
+
+    def estimate_parameter_resolutions(self, model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+        """
+        Estimate resolution for each parameter based on its empirical distribution.
+        Returns tensors for differentiability.
+        """
+        resolutions = {}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            flat = param.data.reshape(-1)
+            if flat.numel() == 0:
+                continue
+
+            # Use the base resolution scale
+            resolution = torch.tensor(
+                self.param_resolution_scale, device=param.device, dtype=param.dtype
+            )
+            resolutions[name] = resolution
+
+        return resolutions
+
+    def compute_model_bits(self, model: torch.nn.Module) -> torch.Tensor:
+        """
+        Compute model complexity bits by treating each parameter tensor as a "feature".
+        """
+        resolutions = self.estimate_parameter_resolutions(model)
+        total_bits = torch.tensor(0.0)
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad or name not in resolutions:
+                continue
+
+            # Flatten parameter tensor
+            flat_param = param.reshape(-1)
+            if flat_param.numel() == 0:
+                continue
+
+            # Process as feature with fixed resolution
+            param_bits = process_parameter_tensor(flat_param, resolutions[name])
+
+            # Move to same device if needed
+            if total_bits.device != param_bits.device:
+                total_bits = total_bits.to(param_bits.device)
+
+            total_bits = total_bits + param_bits
+
+        return total_bits

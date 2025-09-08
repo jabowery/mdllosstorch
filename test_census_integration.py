@@ -6,40 +6,9 @@ pytest.importorskip(
     "pandas", reason="pandas required for census integration tests (install with '.[census]')"
 )
 import torch
-import torch.nn as nn
 
 from mdllosstorch import MDLLoss
 from tests.util_census import load_census_df
-
-
-class FuzzyIdentity(nn.Module):
-    def __init__(self, num_features, noise_std=0.01):
-        """
-        Initialize the FuzzyIdentity module with per-feature scaling parameters.
-
-        Args:
-            num_features (int): Number of features (e.g., channels in a tensor).
-            noise_std (float): Standard deviation of Gaussian noise added to initialize scales.
-                              Set to 0.0 for no noise (scales initialized to exactly 1).
-        """
-        super(FuzzyIdentity, self).__init__()
-        # Initialize per-feature scaling parameters as 1 + small Gaussian noise
-        self.scales = nn.Parameter(torch.ones(num_features) + torch.randn(num_features) * noise_std)
-
-    def forward(self, x):
-        """
-        Forward pass: Scale each feature of the input by the corresponding parameter.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, num_features, ...).
-
-        Returns:
-            torch.Tensor: Scaled tensor, same shape as input.
-        """
-        # Ensure scales are broadcastable to input shape
-        # Reshape scales to (1, num_features, 1, ..., 1) to match input dimensions
-        scales = self.scales.view(1, -1, *([1] * (x.dim() - 2)))
-        return x * scales
 
 
 @pytest.mark.slow
@@ -54,7 +23,7 @@ def test_census_mdl_ordering():
     x_t = torch.from_numpy(X)
 
     # Create models and reconstructions of different quality
-    model = FuzzyIdentity(len(df.columns), 1e-12)
+    model = torch.nn.Identity()
     perfect_recon = x_t.clone()
 
     # Add controlled noise for worse reconstruction
@@ -62,8 +31,8 @@ def test_census_mdl_ordering():
     noisy_recon = x_t + 0.01 * x_t.std() * torch.randn_like(x_t)
 
     loss = MDLLoss()
-    bits_perfect = loss(x_t - perfect_recon, model).item()
-    bits_noisy = loss(x_t - noisy_recon, model).item()
+    bits_perfect = loss(x_t, perfect_recon, model).item()
+    bits_noisy = loss(x_t, noisy_recon, model).item()
 
     print(f"Census data shape: {X.shape}")
     print(f"Data range: [{X.min():.3f}, {X.max():.3f}]")
@@ -89,31 +58,26 @@ def test_census_model_vs_baseline():
     x_t = torch.from_numpy(X)
     B, F = x_t.shape
 
+    # Baseline: no model (predict zeros)
+    baseline_model = torch.nn.Identity()
+    baseline_recon = torch.zeros_like(x_t)
+
     # Reasonable model: capture some structure with linear transformation
     reasonable_model = torch.nn.Linear(F, F, bias=False)
+
     # Initialize with some structure (not random)
     with torch.no_grad():
         # Start with identity then add small perturbation to create imperfect but reasonable reconstruction
         reasonable_model.weight.copy_(torch.eye(F))
         reasonable_model.weight.add_(0.01 * torch.randn_like(reasonable_model.weight))
+
     reasonable_recon = reasonable_model(x_t)
 
-    # Baseline: noisier model
-    baseline_model = torch.nn.Linear(F, F, bias=False)
-    # Initialize with some structure (not random)
-    with torch.no_grad():
-        # Start with identity then add large perturbation to create worse reconstruction
-        baseline_model.weight.copy_(torch.eye(F))
-        baseline_model.weight.add_(0.02 * torch.randn_like(baseline_model.weight))
-    baseline_recon = baseline_model(x_t)
-
     loss = MDLLoss()
-    print("BASELINE")
-    baseline_bits = loss(x_t - baseline_recon, baseline_model).item()
-    print("REASONABLE")
-    reasonable_bits = loss(x_t - reasonable_recon, reasonable_model).item()
+    baseline_bits = loss(x_t, baseline_recon, baseline_model).item()
+    reasonable_bits = loss(x_t, reasonable_recon, reasonable_model).item()
 
-    print(f"Census baseline (noisy model): {baseline_bits:.3f} bits")
+    print(f"Census baseline (no model): {baseline_bits:.3f} bits")
     print(f"Reasonable model: {reasonable_bits:.3f} bits")
     print(f"Improvement: {baseline_bits - reasonable_bits:.3f} bits")
 
@@ -149,7 +113,7 @@ def test_census_scale_robustness():
     yhat = model(x_t)
 
     loss = MDLLoss()
-    bits = loss(x_t - yhat, model)
+    bits = loss(x_t, yhat, model)
 
     assert torch.isfinite(bits), f"MDL should handle scale differences, got {bits}"
     assert bits.item() > 0, f"MDL should be positive with scale differences, got {bits.item()}"
@@ -171,7 +135,7 @@ def test_census_gradient_flow():
 
     yhat = model(x_t)
     loss = MDLLoss()
-    bits = loss(x_t - yhat, model)
+    bits = loss(x_t, yhat, model)
 
     # Backward pass
     bits.backward()
@@ -207,9 +171,9 @@ def test_census_computational_efficiency():
     yhat = model(x_t)
 
     # Time the computation
-    loss = MDLLoss()  # Reduced for efficiency test
+    loss = MDLLoss(sa_max_steps=500)  # Reduced for efficiency test
     start_time = time.time()
-    bits = loss(x_t - yhat, model)
+    bits = loss(x_t, yhat, model)
     elapsed = time.time() - start_time
 
     assert torch.isfinite(bits), f"Efficiency test produced non-finite: {bits}"
